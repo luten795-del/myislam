@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Offline — MyIslam</title>
+  <style>
+    body{font-family:system-ui,Arial, sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#f7faf7;color:#0f1720}
+    .card{background:#fff;padding:28px;border-radius:12px;box-shadow:0 8px 24px rgba(0,0,0,.08);max-width:720px;text-align:center}
+    h1{margin:0 0 8px;font-size:22px}
+    p{margin:0 0 16px;color:#475569}
+    a.btn{display:inline-block;padding:10px 14px;border-radius:8px;background:#166534;color:#fff;text-decoration:none}
+    .lesson-list{list-style:none;padding:0;margin:0 0 16px;text-align:left;max-height:280px;overflow-y:auto}
+    .lesson-list li{border-bottom:1px solid #e2e5e2;padding:10px 4px}
+    .lesson-list li:last-child{border-bottom:none}
+    .lesson-list a{color:#0E4A34;text-decoration:none;font-weight:600}
+    .lesson-list a:hover{text-decoration:underline}
+    .empty-note{color:#94a3b8;font-size:14px}
+  </style>
+</head>
+<body>
+  <div class="card" id="offlineCard">
+    <h1>You're offline</h1>
+    <p id="offlineMessage">The MyIslam app is currently offline. Connect to the internet to sync progress and load new content.</p>
+    <div id="loggedInSection" style="display:none;">
+      <ul class="lesson-list" id="downloadedLessonsList"></ul>
+      <p class="empty-note" id="noDownloadsNote" style="display:none;">You haven't downloaded any lessons yet. Connect to the internet and tap "Download for offline" on a lesson to read it later without a connection.</p>
+    </div>
+    <div>
+      <a href="/" class="btn">Go to home</a>
+      <a href="/offline-lesson.html" class="btn" style="background:transparent;color:#166534;border:1px solid #166534;margin-left:8px;">Open a downloaded lesson</a>
+    </div>
+  </div>
+
+  <script src="/assets/js/offline-db.js"></script>
+  <script>
+    // "Stay logged in across offline periods": includes/pwa.php stamps this
+    // flag into localStorage on every page load based on the REAL server
+    // session at that time. If it's true, this person was logged in as of
+    // their last successful page load - show them their actual downloaded
+    // lessons instead of a dead-end message, without needing (or being
+    // able to attempt) any fresh login while offline.
+    (async function () {
+      const wasLoggedIn = localStorage.getItem('myislam_logged_in') === 'true';
+      if (!wasLoggedIn) return; // Keep the generic message as-is.
+
+      document.getElementById('offlineMessage').textContent =
+          "You're offline, but you're still signed in. Here's what you've saved for offline reading:";
+      document.getElementById('loggedInSection').style.display = 'block';
+
+      try {
+        const lessons = await OfflineDB.listLessons();
+        const listEl = document.getElementById('downloadedLessonsList');
+        if (!lessons.length) {
+          document.getElementById('noDownloadsNote').style.display = 'block';
+          return;
+        }
+        lessons.forEach((lesson) => {
+          const li = document.createElement('li');
+          const a = document.createElement('a');
+          a.href = `/offline-lesson.html?id=${encodeURIComponent(lesson.id)}`;
+          a.textContent = lesson.title || 'Untitled lesson';
+          li.appendChild(a);
+          listEl.appendChild(li);
+        });
+      } catch (err) {
+        console.warn('Could not list downloaded lessons:', err);
+      }
+    })();
+  </script>
+</body>
+</html>

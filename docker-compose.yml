@@ -1,0 +1,59 @@
+
+services:
+  web:
+    build: .
+    container_name: myislam-web
+    restart: unless-stopped
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    volumes:
+      - ./myislam-v2:/var/www/html
+      - ./uploads.ini:/usr/local/etc/php/conf.d/uploads.ini
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - myislam-net
+
+  db:
+    image: mysql:8.0
+    container_name: myislam-db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-myislam}
+      MYSQL_USER: ${MYSQL_USER:-myislam_user}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    ports:
+      - "${DB_PORT:-3306}:3306"
+    volumes:
+      - myislam_db_data:/var/lib/mysql
+      - ./myislam.sql:/docker-entrypoint-initdb.d/myislam.sql:ro
+    networks:
+      - myislam-net
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin
+    container_name: myislam-pma
+    restart: unless-stopped
+    environment:
+      PMA_HOST: db
+      PMA_PORT: 3306
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+    ports:
+      - "${PMA_PORT:-8081}:80"
+    depends_on:
+      - db
+    networks:
+      - myislam-net
+
+networks:
+  myislam-net:
+    driver: bridge
+
+volumes:
+  myislam_db_data:

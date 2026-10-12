@@ -1,0 +1,40 @@
+[24-Apr-2026 05:26:03 UTC] PHP Fatal error:  Uncaught TypeError: e(): Argument #1 ($v) must be of type ?string, int given, called in C:\wamp64\www\myislam\take_certification_exam.php on line 584 and defined in C:\wamp64\www\myislam\take_certification_exam.php:28
+Stack trace:
+#0 C:\wamp64\www\myislam\take_certification_exam.php(584): e(6)
+#1 {main}
+  thrown in C:\wamp64\www\myislam\take_certification_exam.php on line 28
+[24-Apr-2026 05:26:04 UTC] PHP Fatal error:  Uncaught TypeError: e(): Argument #1 ($v) must be of type ?string, int given, called in C:\wamp64\www\myislam\take_certification_exam.php on line 584 and defined in C:\wamp64\www\myislam\take_certification_exam.php:28
+Stack trace:
+#0 C:\wamp64\www\myislam\take_certification_exam.php(584): e(6)
+#1 {main}
+  thrown in C:\wamp64\www\myislam\take_certification_exam.php on line 28
+[24-Apr-2026 05:26:15 UTC] PHP Fatal error:  Uncaught TypeError: e(): Argument #1 ($v) must be of type ?string, int given, called in C:\wamp64\www\myislam\take_certification_exam.php on line 584 and defined in C:\wamp64\www\myislam\take_certification_exam.php:28
+Stack trace:
+#0 C:\wamp64\www\myislam\take_certification_exam.php(584): e(6)
+#1 {main}
+  thrown in C:\wamp64\www\myislam\take_certification_exam.php on line 28
+[24-Apr-2026 05:26:15 UTC] PHP Fatal error:  Uncaught TypeError: e(): Argument #1 ($v) must be of type ?string, int given, called in C:\wamp64\www\myislam\take_certification_exam.php on line 584 and defined in C:\wamp64\www\myislam\take_certification_exam.php:28
+Stack trace:
+#0 C:\wamp64\www\myislam\take_certification_exam.php(584): e(6)
+#1 {main}
+  thrown in C:\wamp64\www\myislam\take_certification_exam.php on line 28
+[24-Apr-2026 05:26:16 UTC] PHP Fatal error:  Uncaught TypeError: e(): Argument #1 ($v) must be of type ?string, int given, called in C:\wamp64\www\myislam\take_certification_exam.php on line 584 and defined in C:\wamp64\www\myislam\take_certification_exam.php:28
+Stack trace:
+#0 C:\wamp64\www\myislam\take_certification_exam.php(584): e(6)
+#1 {main}
+  thrown in C:\wamp64\www\myislam\take_certification_exam.php on line 28
+[24-Apr-2026 05:26:19 UTC] PHP Fatal error:  Uncaught TypeError: e(): Argument #1 ($v) must be of type ?string, int given, called in C:\wamp64\www\myislam\take_certification_exam.php on line 584 and defined in C:\wamp64\www\myislam\take_certification_exam.php:28
+Stack trace:
+#0 C:\wamp64\www\myislam\take_certification_exam.php(584): e(6)
+#1 {main}
+  thrown in C:\wamp64\www\myislam\take_certification_exam.php on line 28
+[24-Apr-2026 05:26:19 UTC] PHP Fatal error:  Uncaught TypeError: e(): Argument #1 ($v) must be of type ?string, int given, called in C:\wamp64\www\myislam\take_certification_exam.php on line 584 and defined in C:\wamp64\www\myislam\take_certification_exam.php:28
+Stack trace:
+#0 C:\wamp64\www\myislam\take_certification_exam.php(584): e(6)
+#1 {main}
+  thrown in C:\wamp64\www\myislam\take_certification_exam.php on line 28
+[24-Apr-2026 05:26:22 UTC] PHP Fatal error:  Uncaught TypeError: e(): Argument #1 ($v) must be of type ?string, int given, called in C:\wamp64\www\myislam\take_certification_exam.php on line 584 and defined in C:\wamp64\www\myislam\take_certification_exam.php:28
+Stack trace:
+#0 C:\wamp64\www\myislam\take_certification_exam.php(584): e(6)
+#1 {main}
+  thrown in C:\wamp64\www\myislam\take_certification_exam.php on line 28
