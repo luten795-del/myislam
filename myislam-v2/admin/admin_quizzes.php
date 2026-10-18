@@ -733,6 +733,228 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             exit;
         }
     }
+        if ($action === 'copy_quiz') {
+        $sourceId   = isset($_POST['source_id']) ? (int)$_POST['source_id'] : 0;
+        $targetMode = strtolower(trim((string)($_POST['target_mode'] ?? '')));
+        $newTitle   = trim((string)($_POST['new_title'] ?? ''));
+        $copyAll    = !empty($_POST['copy_all']);
+
+        if ($sourceId <= 0) {
+            if ($isAjax) {
+                header('Content-Type: application/json');
+                echo json_encode(['success' => false, 'message' => 'Invalid source quiz.']);
+                exit;
+            }
+            $message = 'Invalid source quiz.';
+            $messageType = 'danger';
+        } elseif (!in_array($targetMode, ['lesson', 'competition', 'self'], true)) {
+            if ($isAjax) {
+                header('Content-Type: application/json');
+                echo json_encode(['success' => false, 'message' => 'Invalid target mode.']);
+                exit;
+            }
+            $message = 'Invalid target mode.';
+            $messageType = 'danger';
+        } else {
+            try {
+                $source = getQuizById($conn, $sourceId);
+                if (!$source) {
+                    throw new RuntimeException('Source quiz not found.');
+                }
+
+                // If "copy to all" is set, we create 2 copies: to the two modes
+                // other than the source's own mode. If only one target mode is
+                // requested, we create a single copy.
+                $sourceMode = strtolower((string)($source['mode'] ?? 'lesson'));
+                if ($copyAll) {
+                    $targets = array_values(array_diff(['lesson', 'competition', 'self'], [$sourceMode]));
+                } else {
+                    $targets = [$targetMode];
+                }
+
+                $createdIds = [];
+
+                $conn->beginTransaction();
+
+                foreach ($targets as $tm) {
+                    // ---------- 1. Build the new quizzes row ----------
+                    // Copy every column from source, then override the ones
+                    // that must not be shared with the copy.
+                    $newRow = $source;
+                    unset($newRow['id'], $newRow['created_at'], $newRow['updated_at'], $newRow['published_at']);
+
+                    // If the copy-all loop is running and admin provided a title,
+                    // only use it for the first copy; suffix the mode for the rest.
+                    if ($newTitle !== '') {
+                        $baseTitle = $newTitle;
+                        // Strip any mode suffix the admin might have typed
+                        $baseTitle = preg_replace('/\s*\((?:Lesson|Competition|Self)(?:\s*Copy)?\)\s*$/i', '', $baseTitle);
+                    } else {
+                        $baseTitle = preg_replace('/\s*\((?:Lesson|Competition|Self|Copy)(?:\s*Copy)?\)\s*$/i', '', (string)$source['title']);
+                    }
+
+                    if ($copyAll) {
+                        $modeLabel = ucfirst($tm);
+                        $newRow['title'] = $baseTitle . ' (' . $modeLabel . ')';
+                    } else {
+                        $newRow['title'] = $baseTitle . ' (Copy)';
+                    }
+
+                    // Unique slug based on the original slug
+                    $baseSlug = make_slug((string)($source['slug'] ?? $source['title'] ?? 'quiz'));
+                    $newRow['slug'] = uniqueQuizSlug($conn, $baseSlug, null);
+
+                    // Mode + status overrides
+                    $newRow['mode']   = $tm;
+                    $newRow['status'] = 'draft';
+                    $newRow['published_at'] = null;
+
+                    // Academy link — never inherited by a copy
+                    if (array_key_exists('course_id', $newRow))   $newRow['course_id']   = null;
+                    if (array_key_exists('division_id', $newRow)) $newRow['division_id'] = null;
+                    if (array_key_exists('week_number', $newRow)) $newRow['week_number'] = null;
+
+                    // Competition window:
+                    //   - if copying TO competition AND source is competition → keep dates
+                    //   - otherwise → clear dates
+                    if (array_key_exists('competition_start_at', $newRow)) {
+                        if ($tm !== 'competition' || $sourceMode !== 'competition') {
+                            $newRow['competition_start_at'] = null;
+                        }
+                    }
+                    if (array_key_exists('competition_end_at', $newRow)) {
+                        if ($tm !== 'competition' || $sourceMode !== 'competition') {
+                            $newRow['competition_end_at'] = null;
+                        }
+                    }
+                    if (array_key_exists('prize_description', $newRow) && $tm !== 'competition') {
+                        $newRow['prize_description'] = null;
+                    }
+
+                    // content_id: only meaningful in lesson mode.
+                    // Keep it if target is lesson (source was lesson), else clear.
+                    if (array_key_exists('content_id', $newRow)) {
+                        if ($tm !== 'lesson') {
+                            $newRow['content_id'] = null;
+                        }
+                    }
+
+                    // created_by — attribute the copy to the current admin
+                    if (array_key_exists('created_by', $newRow)) {
+                        $newRow['created_by'] = $userId;
+                    }
+
+                    // Admin explicitly allowed access at creation time
+                    if (array_key_exists('allow_access', $newRow)) {
+                        $newRow['allow_access'] = 1;
+                    }
+
+                    // ---------- 2. Insert the new quiz ----------
+                    $columns = array_keys($newRow);
+                    $placeholders = array_fill(0, count($columns), '?');
+                    $sql = "INSERT INTO quizzes (" . implode(', ', $columns) . ")
+                            VALUES (" . implode(', ', $placeholders) . ")";
+                    $stmt = $conn->prepare($sql);
+                    $stmt->execute(array_values($newRow));
+                    $newQuizId = (int)$conn->lastInsertId();
+
+                    if ($newQuizId <= 0) {
+                        throw new RuntimeException('Failed to create quiz copy.');
+                    }
+
+                    // ---------- 3. Duplicate quiz_questions + quiz_options ----------
+                    $questionsStmt = $conn->prepare("
+                        SELECT * FROM quiz_questions
+                        WHERE quiz_id = ?
+                        ORDER BY sort_order ASC, id ASC
+                    ");
+                    $questionsStmt->execute([$sourceId]);
+                    $questions = $questionsStmt->fetchAll(PDO::FETCH_ASSOC);
+
+                    $hasKeywordsJson = columnExists($conn, 'quiz_questions', 'keywords_json');
+                    $hasExpectedAnswer = columnExists($conn, 'quiz_questions', 'expected_answer');
+
+                    foreach ($questions as $q) {
+                        $newQ = $q;
+                        unset($newQ['id'], $newQ['created_at'], $newQ['updated_at']);
+                        $newQ['quiz_id'] = $newQuizId;
+
+                        $qCols = array_keys($newQ);
+                        $qPlace = array_fill(0, count($qCols), '?');
+                        $qSql = "INSERT INTO quiz_questions (" . implode(', ', $qCols) . ")
+                                VALUES (" . implode(', ', $qPlace) . ")";
+                        $qStmt = $conn->prepare($qSql);
+                        $qStmt->execute(array_values($newQ));
+                        $newQuestionId = (int)$conn->lastInsertId();
+
+                        if ($newQuestionId <= 0) {
+                            throw new RuntimeException('Failed to copy a question.');
+                        }
+
+                        // Duplicate options
+                        $optStmt = $conn->prepare("
+                            SELECT * FROM quiz_options
+                            WHERE question_id = ?
+                            ORDER BY sort_order ASC, id ASC
+                        ");
+                        $optStmt->execute([(int)$q['id']]);
+                        $options = $optStmt->fetchAll(PDO::FETCH_ASSOC);
+
+                        foreach ($options as $o) {
+                            $newO = $o;
+                            unset($newO['id'], $newO['created_at'], $newO['updated_at']);
+                            $newO['question_id'] = $newQuestionId;
+
+                            $oCols = array_keys($newO);
+                            $oPlace = array_fill(0, count($oCols), '?');
+                            $oSql = "INSERT INTO quiz_options (" . implode(', ', $oCols) . ")
+                                    VALUES (" . implode(', ', $oPlace) . ")";
+                            $oStmt = $conn->prepare($oSql);
+                            $oStmt->execute(array_values($newO));
+                        }
+                    }
+
+                    $createdIds[] = $newQuizId;
+                }
+
+                $conn->commit();
+
+                $count = count($createdIds);
+                $firstId = $createdIds[0] ?? 0;
+
+                if ($isAjax) {
+                    header('Content-Type: application/json');
+                    echo json_encode([
+                        'success' => true,
+                        'message' => $count === 1
+                            ? 'Quiz copied. Opened the new copy for editing.'
+                            : "Created {$count} copies. Opened the first one for editing.",
+                        'redirect' => 'admin_quizzes.php?tab=' . urlencode($copyAll ? 'all' : $targetMode)
+                                    . '&edit=' . $firstId
+                    ]);
+                    exit;
+                }
+
+                $message = $count === 1
+                    ? 'Quiz copied successfully.'
+                    : "Created {$count} copies.";
+                $messageType = 'success';
+
+            } catch (Throwable $e) {
+                if ($conn->inTransaction()) {
+                    $conn->rollBack();
+                }
+                error_log('copy_quiz error: ' . $e->getMessage());
+                if ($isAjax) {
+                    header('Content-Type: application/json');
+                    echo json_encode(['success' => false, 'message' => 'Copy failed: ' . $e->getMessage()]);
+                    exit;
+                }
+                $message = 'Copy failed: ' . $e->getMessage();
+                $messageType = 'danger';
+            }
+        }
+    }
 }
 
 $subjects = getSubjects($conn);
@@ -1090,11 +1312,17 @@ a{text-decoration:none;color:inherit} button,input,textarea,select{font:inherit}
                                 </div>
                                 <div class="quiz-actions">
                                     <span class="badge <?php echo $mode; ?>"><?php echo ucfirst($mode); ?></span>
-                                    <span class="badge <?php echo e($quizStatus); ?>"><?php echo e(ucfirst($quizStatus)); ?></span>
+<span class="badge <?php echo e($status ?? 'draft'); ?>"><?php echo e(ucfirst($status ?? 'draft')); ?></span>
                                     <?php $isAccessLocked = isset($quiz['allow_access']) && (int)$quiz['allow_access'] === 0; ?>
                                     <?php if ($isAccessLocked): ?>
                                         <span class="badge danger" title="Users cannot access this quiz">🔒 Access Locked</span>
                                     <?php endif; ?>
+                                                                        <button class="btn secondary copy-quiz-btn"
+                                            data-quiz-id="<?php echo (int)$quiz['id']; ?>"
+                                            data-quiz-mode="<?php echo e($quiz['mode'] ?? $mode); ?>"
+                                            data-quiz-title="<?php echo e($quiz['title'] ?? 'Untitled'); ?>">
+                                        📋 Copy
+                                    </button>
                                     <button class="btn secondary edit-quiz-btn" data-quiz-id="<?php echo (int)$quiz['id']; ?>">✏️ Edit</button>
                                     <a href="admin_quiz_questions.php?quiz_id=<?php echo (int)$quiz['id']; ?>" class="btn warn">❓ Questions</a>
                                     <button class="btn secondary toggle-status-btn" data-quiz-id="<?php echo (int)$quiz['id']; ?>"><?php echo $quizStatus === 'published' ? '📄 Unpublish' : '🚀 Publish'; ?></button>
@@ -1137,6 +1365,7 @@ a{text-decoration:none;color:inherit} button,input,textarea,select{font:inherit}
                     <div class="quiz-list" id="allList">
                         <?php foreach ($allQuizzes as $quiz): 
                             $mode = $quiz['mode'] ?? 'lesson';
+                                $status = strtolower((string)($quiz['status'] ?? 'draft'));
                             $status = strtolower((string)($quiz['status'] ?? 'draft'));
                             $searchBlob = strtolower($mode . ' ' . ($quiz['title'] ?? '') . ' ' . ($quiz['subject_name'] ?? '') . ' ' . ($quiz['content_title'] ?? ''));
                         ?>
@@ -1158,15 +1387,23 @@ a{text-decoration:none;color:inherit} button,input,textarea,select{font:inherit}
                                         </div>
                                     </div>
                                 </div>
-                                <div class="quiz-actions">
+                                                          <div class="quiz-actions">
                                     <span class="badge <?php echo $mode; ?>"><?php echo ucfirst($mode); ?></span>
-                                    <?php $isAccessLockedAll = isset($quiz['allow_access']) && (int)$quiz['allow_access'] === 0; ?>
-                                    <?php if ($isAccessLockedAll): ?>
+                                    <span class="badge <?php echo e($quizStatus); ?>"><?php echo e(ucfirst($quizStatus)); ?></span>
+                                    <?php $isAccessLocked = isset($quiz['allow_access']) && (int)$quiz['allow_access'] === 0; ?>
+                                    <?php if ($isAccessLocked): ?>
                                         <span class="badge danger" title="Users cannot access this quiz">🔒 Access Locked</span>
                                     <?php endif; ?>
+                                    <button class="btn secondary copy-quiz-btn"
+                                            data-quiz-id="<?php echo (int)$quiz['id']; ?>"
+                                            data-quiz-mode="<?php echo e($mode); ?>"
+                                            data-quiz-title="<?php echo e($quiz['title'] ?? 'Untitled'); ?>">
+                                        📋 Copy
+                                    </button>
                                     <button class="btn secondary edit-quiz-btn" data-quiz-id="<?php echo (int)$quiz['id']; ?>">✏️ Edit</button>
                                     <a href="admin_quiz_questions.php?quiz_id=<?php echo (int)$quiz['id']; ?>" class="btn warn">❓ Questions</a>
-                                    <button class="btn secondary toggle-access-btn" data-quiz-id="<?php echo (int)$quiz['id']; ?>"><?php echo $isAccessLockedAll ? '🔓 Unlock Access' : '🔒 Lock Access'; ?></button>
+                                                                        <?php $isAccessLockedAll = $isAccessLocked; ?>
+                             <button class="btn secondary toggle-access-btn" data-quiz-id="<?php echo (int)$quiz['id']; ?>"><?php echo $isAccessLocked ? '🔓 Unlock Access' : '🔒 Lock Access'; ?></button>       
                                 </div>
                             </div>
                         <?php endforeach; ?>
@@ -1323,6 +1560,58 @@ a{text-decoration:none;color:inherit} button,input,textarea,select{font:inherit}
                 <div class="action-row">
                     <button type="submit" class="btn primary" id="saveQuizBtn">Save Quiz</button>
                     <button type="button" class="btn secondary" id="cancelModalBtn">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    <!-- Copy Quiz Dialog -->
+
+</div>
+<div class="modal-overlay" id="copyQuizModal">
+    <div class="modal" style="max-width:520px;">
+        <div class="modal-header">
+            <h2>📋 Copy Quiz</h2>
+            <button class="modal-close" id="closeCopyModalBtn">&times;</button>
+        </div>
+        <div class="modal-body">
+            <form id="copyQuizForm">
+                <input type="hidden" name="action" value="copy_quiz">
+                <input type="hidden" name="source_id" id="copySourceId" value="0">
+
+                <div class="form-row">
+                    <label>Source quiz</label>
+                    <div id="copySourceTitle" style="font-weight:600;padding:10px 12px;border-radius:12px;background:var(--surface-2);border:1px solid var(--line);">
+                        —
+                    </div>
+                </div>
+
+                <div class="form-row" id="copyTargetRow">
+                    <label for="copyTargetMode">Copy to mode *</label>
+                    <select id="copyTargetMode" name="target_mode" class="form-select">
+                        <option value="lesson">📖 Lesson</option>
+                        <option value="competition">🏆 Competition</option>
+                        <option value="self">🔍 Self</option>
+                    </select>
+                </div>
+
+                <div class="form-row">
+                    <label for="copyNewTitle">New title</label>
+                    <input type="text" id="copyNewTitle" name="new_title" class="form-input">
+                    <small style="color:var(--muted);font-size:12px;">
+                        Leave as-is for the default. When copying to all modes, each copy gets a mode suffix.
+                    </small>
+                </div>
+
+                <div class="checkbox-group">
+                    <label class="checkbox-item">
+                        <input type="checkbox" name="copy_all" id="copyAllModes" value="1">
+                        📚 Copy to <strong>all other modes</strong> at once
+                    </label>
+                </div>
+
+                <div class="action-row">
+                    <button type="submit" class="btn primary" id="copyQuizSubmitBtn">📋 Copy Quiz</button>
+                    <button type="button" class="btn secondary" id="cancelCopyBtn">Cancel</button>
                 </div>
             </form>
         </div>
@@ -1715,6 +2004,94 @@ document.querySelectorAll('.delete-quiz-btn').forEach(btn => {
     allMode?.addEventListener('change', filterAll);
     allStatus?.addEventListener('change', filterAll);
 })();
+
+// -----------------------------------------------------------------------------
+// Copy quiz dialog
+// -----------------------------------------------------------------------------
+(function () {
+    const copyModal       = document.getElementById('copyQuizModal');
+    const copySourceId    = document.getElementById('copySourceId');
+    const copySourceTitle = document.getElementById('copySourceTitle');
+    const copyTargetMode  = document.getElementById('copyTargetMode');
+    const copyTargetRow   = document.getElementById('copyTargetRow');
+    const copyNewTitle    = document.getElementById('copyNewTitle');
+    const copyAllModes    = document.getElementById('copyAllModes');
+    const copyForm        = document.getElementById('copyQuizForm');
+    const copySubmitBtn   = document.getElementById('copyQuizSubmitBtn');
+    const closeCopyBtn    = document.getElementById('closeCopyModalBtn');
+    const cancelCopyBtn   = document.getElementById('cancelCopyBtn');
+
+    if (!copyModal) return;
+
+    function openCopyModal(id, mode, title) {
+        copySourceId.value    = id;
+        copySourceTitle.textContent = title + ' (' + mode + ')';
+        copyTargetMode.value  = mode === 'lesson' ? 'competition' : 'lesson';
+        copyNewTitle.value    = title + ' (Copy)';
+        copyAllModes.checked  = false;
+        syncCopyAllState();
+        copyModal.style.display = 'flex';
+        document.body.style.overflow = 'hidden';
+    }
+
+    function closeCopyModal() {
+        copyModal.style.display = 'none';
+        document.body.style.overflow = '';
+    }
+
+    function syncCopyAllState() {
+        copyTargetRow.style.display = copyAllModes.checked ? 'none' : '';
+    }
+
+    document.querySelectorAll('.copy-quiz-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            openCopyModal(
+                btn.dataset.quizId,
+                btn.dataset.quizMode || 'lesson',
+                btn.dataset.quizTitle || 'Untitled'
+            );
+        });
+    });
+
+    copyAllModes.addEventListener('change', syncCopyAllState);
+
+    closeCopyBtn?.addEventListener('click', closeCopyModal);
+    cancelCopyBtn?.addEventListener('click', closeCopyModal);
+    copyModal.addEventListener('click', e => {
+        if (e.target === copyModal) closeCopyModal();
+    });
+
+    copyForm.addEventListener('submit', async e => {
+        e.preventDefault();
+        const formData = new FormData(copyForm);
+        copySubmitBtn.disabled = true;
+        copySubmitBtn.textContent = '📋 Copying...';
+        try {
+            const response = await fetch('admin_quizzes.php', {
+                method: 'POST',
+                body: formData,
+                headers: { 'X-Requested-With': 'XMLHttpRequest' }
+            });
+            const result = await response.json();
+            showToast(result.message, result.success ? 'success' : 'danger');
+            if (result.success) {
+                closeCopyModal();
+                if (result.redirect) {
+                    window.location.href = result.redirect;
+                } else {
+                    setTimeout(() => location.reload(), 800);
+                }
+            }
+        } catch (err) {
+            showToast('Copy failed: network error', 'danger');
+        } finally {
+            copySubmitBtn.disabled = false;
+            copySubmitBtn.textContent = '📋 Copy Quiz';
+        }
+    });
+})();
+
+
 </script>
 </body>
 </html>

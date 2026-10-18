@@ -43,6 +43,22 @@ if (!$conn) {
     die('Unable to connect to database.');
 }
 
+// ---------------------------------------------------------------------------
+// Migrate: add markaz_image_path column if missing
+// ---------------------------------------------------------------------------
+try {
+    $hasCol = false;
+    $chk = $conn->query("SHOW COLUMNS FROM `subjects` LIKE 'markaz_image_path'");
+    if ($chk && $chk->rowCount() > 0) {
+        $hasCol = true;
+    }
+    if (!$hasCol) {
+        $conn->exec("ALTER TABLE `subjects` ADD COLUMN `markaz_image_path` VARCHAR(500) DEFAULT NULL AFTER `markaz`");
+    }
+} catch (PDOException $e) {
+    error_log('admin_subjects markaz_image_path migration: ' . $e->getMessage());
+}
+
 function getAdminUser(PDO $conn, int $userId): ?array {
     try {
         $stmt = $conn->prepare("
@@ -72,6 +88,8 @@ function getSubjects(PDO $conn): array {
                 s.slug,
                 s.description,
                 s.icon,
+                s.image_path,
+                s.markaz_image_path,
                 s.sort_order,
                 s.is_active,
                 s.sheikh_name,
@@ -81,7 +99,7 @@ function getSubjects(PDO $conn): array {
             FROM subjects s
             LEFT JOIN categories c ON c.subject_id = s.id
             LEFT JOIN contents ct ON ct.subject_id = s.id
-            GROUP BY s.id, s.name,s.type, s.slug, s.description, s.icon, s.sort_order, s.is_active, s.sheikh_name, s.markaz
+            GROUP BY s.id, s.name, s.type, s.slug, s.description, s.icon, s.image_path, s.markaz_image_path, s.sort_order, s.is_active, s.sheikh_name, s.markaz
             ORDER BY s.sort_order ASC, s.name ASC
         ");
         return $stmt->fetchAll();
@@ -102,6 +120,7 @@ function getSubjectById(PDO $conn, int $id): ?array {
             description,
             icon,
             image_path,
+            markaz_image_path,
             sort_order,
             is_active,
             sheikh_name,
@@ -138,19 +157,80 @@ function uniqueSlug(PDO $conn, string $baseSlug, ?int $excludeId = null): string
     $slug = $baseSlug !== '' ? $baseSlug : 'subject';
     $originalSlug = $slug;
     $counter = 1;
-    
+
     while (slugExists($conn, $slug, $excludeId)) {
         $slug = $originalSlug . '-' . $counter;
         $counter++;
-        
-        // Safety break
+
         if ($counter > 100) {
             $slug = $originalSlug . '-' . time();
             break;
         }
     }
-    
+
     return $slug;
+}
+
+/**
+ * Handle an image upload for the given folder.
+ * Returns the relative path (e.g. "/uploads/subjects/foo.jpg") on success,
+ * $existingPath if no new file was uploaded, or null on error.
+ */
+function handleImageUpload(string $fieldName, string $subfolder, ?string $existingPath, ?string &$error): ?string {
+    $error = null;
+
+    if (empty($_FILES[$fieldName]['tmp_name']) || !is_uploaded_file($_FILES[$fieldName]['tmp_name'])) {
+        return $existingPath;
+    }
+
+    $f = $_FILES[$fieldName];
+    if ($f['error'] !== UPLOAD_ERR_OK) {
+        $error = 'Upload failed (error ' . $f['error'] . ').';
+        return $existingPath;
+    }
+
+    $maxBytes = 4 * 1024 * 1024;
+    if ((int)$f['size'] > $maxBytes) {
+        $error = 'Image must be 4 MB or smaller.';
+        return $existingPath;
+    }
+
+    $mime = function_exists('mime_content_type') ? (mime_content_type($f['tmp_name']) ?: '') : '';
+    $allowed = [
+        'image/jpeg' => 'jpg',
+        'image/png'  => 'png',
+        'image/webp' => 'webp',
+        'image/gif'  => 'gif',
+    ];
+    if (!isset($allowed[$mime])) {
+        $error = 'Image must be JPG, PNG, WEBP, or GIF.';
+        return $existingPath;
+    }
+
+    $uploadsRoot = $_SERVER['DOCUMENT_ROOT'] . '/uploads';
+    $dir = $uploadsRoot . '/' . $subfolder;
+    if (!is_dir($dir)) @mkdir($dir, 0755, true);
+
+    $base = pathinfo($f['name'], PATHINFO_FILENAME);
+    $base = preg_replace('/[^A-Za-z0-9._-]/', '-', $base) ?: 'image';
+    $base = trim($base, '-');
+    $fname = $base . '-' . date('YmdHis') . '-' . bin2hex(random_bytes(3)) . '.' . $allowed[$mime];
+    $dest = $dir . '/' . $fname;
+
+    if (!move_uploaded_file($f['tmp_name'], $dest)) {
+        $error = 'Could not save uploaded image.';
+        return $existingPath;
+    }
+
+    // Delete old file if inside uploads/
+    if (!empty($existingPath)) {
+        $old = $_SERVER['DOCUMENT_ROOT'] . '/' . ltrim($existingPath, '/');
+        if (str_starts_with($old, $uploadsRoot) && is_file($old)) {
+            @unlink($old);
+        }
+    }
+
+    return '/uploads/' . $subfolder . '/' . $fname;
 }
 
 $admin = getAdminUser($conn, $userId);
@@ -194,103 +274,113 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $slugInput = trim((string)($_POST['slug'] ?? ''));
         $sheikhName = trim((string)($_POST['sheikh_name'] ?? ''));
         $markaz = trim((string)($_POST['markaz'] ?? ''));
-        
-        // Generate base slug
+
         $baseSlug = make_slug($slugInput !== '' ? $slugInput : $name);
-        
-        // Validate name
+
         if ($name === '') {
             $message = 'Subject name is required.';
             $messageType = 'danger';
         } else {
-            // Get unique slug
             $slug = uniqueSlug($conn, $baseSlug, $subjectId > 0 ? $subjectId : null);
-            
-            // Handle image upload
-            $imagePath = $_POST['existing_image'] ?? null;
-            
-            if (isset($_FILES['subject_image']) && $_FILES['subject_image']['error'] === UPLOAD_ERR_OK && $_FILES['subject_image']['size'] > 0) {
-                $uploadDir = $_SERVER['DOCUMENT_ROOT'] . '/uploads/subjects/';
-                if (!is_dir($uploadDir)) mkdir($uploadDir, 0755, true);
-                
-                $ext = strtolower(pathinfo($_FILES['subject_image']['name'], PATHINFO_EXTENSION));
-                if (in_array($ext, ['jpg', 'jpeg', 'png', 'gif', 'webp'])) {
-                    $filename = 'subject_' . uniqid() . '.' . $ext;
-                    if (move_uploaded_file($_FILES['subject_image']['tmp_name'], $uploadDir . $filename)) {
-                        $imagePath = '/uploads/subjects/' . $filename;
-                    }
+
+            // Existing images
+            $existingImage = $_POST['existing_image'] ?? null;
+            $existingMarkazImage = $_POST['existing_markaz_image'] ?? null;
+
+            // Load existing markaz image from DB (so we don't lose it if the form didn't send it)
+            if ($subjectId > 0 && $existingMarkazImage === null) {
+                try {
+                    $stmt = $conn->prepare("SELECT markaz_image_path FROM subjects WHERE id = ? LIMIT 1");
+                    $stmt->execute([$subjectId]);
+                    $existingMarkazImage = $stmt->fetchColumn() ?: null;
+                } catch (PDOException $e) {}
+            }
+
+            // Upload subject image
+            $imgErr = null;
+            $imagePath = handleImageUpload('subject_image', 'subjects', $existingImage, $imgErr);
+            if ($imgErr !== null) {
+                $message = $imgErr;
+                $messageType = 'danger';
+            }
+
+            // Upload markaz image
+            $markazErr = null;
+            $markazImagePath = handleImageUpload('markaz_image', 'markaz', $existingMarkazImage, $markazErr);
+            if ($markazErr !== null) {
+                // Don't overwrite a successful subject error with this one silently
+                if ($messageType !== 'danger') {
+                    $message = $markazErr;
+                    $messageType = 'danger';
                 }
             }
-            
-            try {
-                // Begin transaction
-                $conn->beginTransaction();
-                
-                if ($subjectId > 0) {
-                    // UPDATE
-                   $stmt = $conn->prepare("
-                UPDATE subjects
-                SET
-                    name = ?,
-                    type = ?,
-                    slug = ?,
-                    description = ?,
-                    icon = ?,
-                    image_path = ?,
-                    sort_order = ?,
-                    is_active = ?,
-                    sheikh_name = ?,
-                    markaz = ?
-                WHERE id = ?
-            ");
 
-            $stmt->execute([
-                $name,
-                $type ?: null,
-                $slug,
-                $description,
-                $icon,
-                $imagePath,
-                $sortOrder,
-                $isActive,
-                $sheikhName ?: null,
-                $markaz ?: null,
-                $subjectId
-            ]);
-                    $message = 'Subject updated successfully.';
-                } else {
-                    // INSERT
-                  $stmt = $conn->prepare("
-                    INSERT INTO subjects
-                    (name, type, slug, description, icon, image_path, sort_order, is_active, sheikh_name, markaz)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ");
+            if ($messageType !== 'danger') {
+                try {
+                    $conn->beginTransaction();
 
-                $stmt->execute([
-                    $name,
-                    $type ?: null,
-                    $slug,
-                    $description,
-                    $icon,
-                    $imagePath,
-                    $sortOrder,
-                    $isActive,
-                    $sheikhName ?: null,
-                    $markaz ?: null
-                ]);
-                    $message = 'Subject created successfully.';
+                    if ($subjectId > 0) {
+                        $stmt = $conn->prepare("
+                            UPDATE subjects
+                            SET
+                                name = ?,
+                                type = ?,
+                                slug = ?,
+                                description = ?,
+                                icon = ?,
+                                image_path = ?,
+                                markaz_image_path = ?,
+                                sort_order = ?,
+                                is_active = ?,
+                                sheikh_name = ?,
+                                markaz = ?
+                            WHERE id = ?
+                        ");
+                        $stmt->execute([
+                            $name,
+                            $type ?: null,
+                            $slug,
+                            $description,
+                            $icon,
+                            $imagePath,
+                            $markazImagePath,
+                            $sortOrder,
+                            $isActive,
+                            $sheikhName ?: null,
+                            $markaz ?: null,
+                            $subjectId,
+                        ]);
+                        $message = 'Subject updated successfully.';
+                    } else {
+                        $stmt = $conn->prepare("
+                            INSERT INTO subjects
+                            (name, type, slug, description, icon, image_path, markaz_image_path, sort_order, is_active, sheikh_name, markaz)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ");
+                        $stmt->execute([
+                            $name,
+                            $type ?: null,
+                            $slug,
+                            $description,
+                            $icon,
+                            $imagePath,
+                            $markazImagePath,
+                            $sortOrder,
+                            $isActive,
+                            $sheikhName ?: null,
+                            $markaz ?: null,
+                        ]);
+                        $message = 'Subject created successfully.';
+                    }
+
+                    $conn->commit();
+                    $messageType = 'success';
+                } catch (PDOException $e) {
+                    $conn->rollBack();
+                    error_log("save_subject error: " . $e->getMessage());
+                    $message = 'Database error: ' . $e->getMessage();
+                    $messageType = 'danger';
                 }
-                
-                // Commit transaction
-                $conn->commit();
-                $messageType = 'success';
-                
-            } catch (PDOException $e) {
-                // Rollback on error
-                $conn->rollBack();
-                error_log("save_subject error: " . $e->getMessage());
-                $message = 'Database error: ' . $e->getMessage();
-                $messageType = 'danger';
             }
         }
 
@@ -340,6 +430,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $message = 'Cannot delete subject with linked categories or contents.';
                     $messageType = 'danger';
                 } else {
+                    $stmt = $conn->prepare("SELECT image_path, markaz_image_path FROM subjects WHERE id = ? LIMIT 1");
+                    $stmt->execute([$subjectId]);
+                    $row = $stmt->fetch(PDO::FETCH_ASSOC) ?: [];
+                    $docRoot = $_SERVER['DOCUMENT_ROOT'];
+                    foreach (['image_path', 'markaz_image_path'] as $col) {
+                        $p = (string)($row[$col] ?? '');
+                        if ($p !== '') {
+                            $abs = $docRoot . '/' . ltrim($p, '/');
+                            if (str_starts_with($abs, $docRoot . '/uploads') && is_file($abs)) {
+                                @unlink($abs);
+                            }
+                        }
+                    }
+
                     $stmt = $conn->prepare("DELETE FROM subjects WHERE id = ?");
                     $stmt->execute([$subjectId]);
                     $message = 'Subject deleted.';
@@ -396,7 +500,6 @@ $sidebarNavigation = [
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>Admin Subjects - MyIslam</title>
 <style>
-/* Keep all your existing CSS here - unchanged */
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
 --bg:#f5f7f5;--surface:#ffffff;--surface-2:#f9fafb;--surface-3:#eef2f7;--line:#e5e7eb;
@@ -463,7 +566,8 @@ a{text-decoration:none;color:inherit} button,input,textarea{font:inherit}
 .subjects-list{display:grid;gap:12px}
 .subject-item{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;padding:16px;background:var(--surface-2);border:1px solid var(--line);border-radius:16px}
 .subject-left{display:flex;align-items:flex-start;gap:12px}
-.subject-icon{width:46px;height:46px;border-radius:14px;background:var(--brand-soft);color:var(--brand);display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0}
+.subject-icon{width:46px;height:46px;border-radius:14px;background:var(--brand-soft);color:var(--brand);display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0;overflow:hidden}
+.subject-icon img{width:100%;height:100%;object-fit:cover}
 .subject-name{font-size:16px;font-weight:800;margin-bottom:4px}
 .subject-meta{font-size:12px;color:var(--muted);line-height:1.6}
 .subject-actions{display:flex;gap:10px;flex-wrap:wrap}
@@ -477,11 +581,10 @@ a{text-decoration:none;color:inherit} button,input,textarea{font:inherit}
 .btn.danger{background:rgba(239,68,68,.12);color:var(--danger);border:1px solid rgba(239,68,68,.3)}
 .btn:hover{transform:translateY(-2px)}
 
-
 /* Modal */
-.modal-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);z-index:2000;backdrop-filter:blur(6px);align-items:center;justify-content:center}
-.modal{background:var(--surface);border-radius:var(--radius-lg);max-width:500px;width:90%;max-height:85vh;overflow-y:auto;box-shadow:var(--shadow-lg);border:1px solid var(--line)}
-.modal-header{padding:24px 24px 16px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}
+.modal-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);z-index:2000;backdrop-filter:blur(6px);align-items:center;justify-content:center;overflow-y:auto;padding:20px}
+.modal{background:var(--surface);border-radius:var(--radius-lg);max-width:520px;width:100%;max-height:90vh;overflow-y:auto;box-shadow:var(--shadow-lg);border:1px solid var(--line)}
+.modal-header{padding:24px 24px 16px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;background:var(--surface);z-index:1}
 .modal-header h2{font-size:20px;font-weight:700}
 .modal-close{background:none;border:none;font-size:28px;cursor:pointer;color:var(--muted)}
 .modal-body{padding:24px}
@@ -495,6 +598,34 @@ a{text-decoration:none;color:inherit} button,input,textarea{font:inherit}
 .check-row{display:flex;align-items:center;gap:10px;padding-top:6px}
 .check-row input{width:18px;height:18px}
 .action-row{display:flex;gap:12px;flex-wrap:wrap;margin-top:16px}
+
+/* Image uploader cards */
+.img-upload-card {
+    padding: 12px;
+    border: 1px dashed var(--line);
+    border-radius: 12px;
+    background: var(--surface-2);
+}
+.img-upload-card .img-preview-wrap {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+    margin-bottom: 8px;
+}
+.img-upload-card .img-preview {
+    width: 90px; height: 90px; flex-shrink: 0;
+    border-radius: 8px;
+    background: var(--surface-3) center/cover no-repeat;
+    display: flex; align-items: center; justify-content: center;
+    border: 1px solid var(--line);
+    font-size: 30px;
+    color: var(--muted);
+    overflow: hidden;
+}
+.img-upload-card .img-preview img { width: 100%; height: 100%; object-fit: cover; }
+.img-upload-card .img-body { flex: 1; min-width: 0; }
+.img-upload-card .img-body label { font-size: 13px; font-weight: 700; display: block; margin-bottom: 4px; }
+.img-upload-card .img-body small { font-size: 11px; color: var(--muted); }
 
 /* Toast */
 .toast-container{position:fixed;top:80px;right:20px;z-index:9999;display:flex;flex-direction:column;gap:10px}
@@ -631,10 +762,19 @@ a{text-decoration:none;color:inherit} button,input,textarea{font:inherit}
                                 ($subject['sheikh_name'] ?? '') . ' ' .
                                 ($subject['markaz'] ?? '')
                             );
+                            $thumb = !empty($subject['image_path'])
+                                ? $subject['image_path']
+                                : (!empty($subject['markaz_image_path']) ? $subject['markaz_image_path'] : null);
                             ?>
                             <div class="subject-item subject-search-item" data-search="<?php echo e($searchBlob); ?>" data-subject-id="<?php echo (int)$subject['id']; ?>">
                                 <div class="subject-left">
-                                    <div class="subject-icon"><?php echo e($subject['icon'] ?? '📚'); ?></div>
+                                    <div class="subject-icon">
+                                        <?php if ($thumb): ?>
+                                            <img src="<?php echo e($thumb); ?>" alt="">
+                                        <?php else: ?>
+                                            <?php echo e($subject['icon'] ?? '📚'); ?>
+                                        <?php endif; ?>
+                                    </div>
                                     <div>
                                         <div class="subject-name"><?php echo e($subject['name'] ?? 'Untitled'); ?></div>
                                         <div class="subject-meta">
@@ -674,7 +814,6 @@ a{text-decoration:none;color:inherit} button,input,textarea{font:inherit}
         </div>
     </main>
 
-   
 <!-- Subject Modal -->
 <div class="modal-overlay" id="subjectModal">
     <div class="modal">
@@ -683,7 +822,7 @@ a{text-decoration:none;color:inherit} button,input,textarea{font:inherit}
             <button class="modal-close" id="closeModalBtn">&times;</button>
         </div>
         <div class="modal-body">
-            <form id="subjectForm">
+            <form id="subjectForm" enctype="multipart/form-data">
                 <input type="hidden" name="action" value="save_subject">
                 <input type="hidden" name="subject_id" id="subject_id" value="0">
 
@@ -745,14 +884,38 @@ a{text-decoration:none;color:inherit} button,input,textarea{font:inherit}
                     </div>
                 </div>
 
+                <!-- SUBJECT BACKGROUND IMAGE -->
                 <div class="form-row">
                     <label>Subject Background Image</label>
-                    <div id="imagePreviewContainer" style="display:none;margin-bottom:8px;">
-                        <img id="imagePreview" src="" style="max-width:200px;max-height:120px;border-radius:8px;border:1px solid var(--line);">
+                    <div class="img-upload-card">
+                        <div class="img-preview-wrap">
+                            <div class="img-preview" id="subjectPreviewBox">
+                                <span>📖</span>
+                            </div>
+                            <div class="img-body">
+                                <input type="file" id="subject_image" name="subject_image" accept="image/*" onchange="previewSubjectImage(this)">
+                                <input type="hidden" id="existing_image" name="existing_image" value="">
+                                <small>JPG / PNG / WEBP · max 4 MB · Recommended 800×400px</small>
+                            </div>
+                        </div>
                     </div>
-                    <input type="file" id="subject_image" name="subject_image" accept="image/*" style="padding:8px;" onchange="previewImage(this)">
-                    <input type="hidden" id="existing_image" name="existing_image" value="">
-                    <small style="color:var(--muted);">Recommended: 800x400px</small>
+                </div>
+
+                <!-- MARKAZ IMAGE -->
+                <div class="form-row">
+                    <label>Markaz Background Image</label>
+                    <div class="img-upload-card">
+                        <div class="img-preview-wrap">
+                            <div class="img-preview" id="markazPreviewBox">
+                                <span>🕌</span>
+                            </div>
+                            <div class="img-body">
+                                <input type="file" id="markaz_image" name="markaz_image" accept="image/*" onchange="previewMarkazImage(this)">
+                                <input type="hidden" id="existing_markaz_image" name="existing_markaz_image" value="">
+                                <small>Used as the teacher card background in course pages · max 4 MB</small>
+                            </div>
+                        </div>
+                    </div>
                 </div>
 
                 <label class="check-row">
@@ -792,6 +955,15 @@ const cancelModalBtn = document.getElementById('cancelModalBtn');
 const subjectForm = document.getElementById('subjectForm');
 const modalTitle = document.getElementById('modalTitle');
 
+function setPreview(boxId, url, fallback) {
+    const box = document.getElementById(boxId);
+    if (url) {
+        box.innerHTML = '<img src="' + url + '" alt="">';
+    } else {
+        box.innerHTML = '<span>' + fallback + '</span>';
+    }
+}
+
 function openModal(data = null) {
     if (data) {
         modalTitle.textContent = 'Edit Subject';
@@ -806,14 +978,9 @@ function openModal(data = null) {
         document.getElementById('sheikh_name').value = data.sheikh_name || '';
         document.getElementById('markaz').value = data.markaz || '';
         document.getElementById('existing_image').value = data.image_path || '';
-        const preview = document.getElementById('imagePreview');
-        const previewContainer = document.getElementById('imagePreviewContainer');
-        if (data.image_path) {
-            preview.src = data.image_path;
-            previewContainer.style.display = 'block';
-        } else {
-            previewContainer.style.display = 'none';
-        }
+        document.getElementById('existing_markaz_image').value = data.markaz_image_path || '';
+        setPreview('subjectPreviewBox', data.image_path || '', '📖');
+        setPreview('markazPreviewBox', data.markaz_image_path || '', '🕌');
     } else {
         modalTitle.textContent = 'Create New Subject';
         subjectForm.reset();
@@ -822,21 +989,30 @@ function openModal(data = null) {
         document.getElementById('is_active').checked = true;
         document.getElementById('sheikh_name').value = '';
         document.getElementById('markaz').value = '';
-        document.getElementById('imagePreviewContainer').style.display = 'none';
         document.getElementById('existing_image').value = '';
+        document.getElementById('existing_markaz_image').value = '';
+        setPreview('subjectPreviewBox', '', '📖');
+        setPreview('markazPreviewBox', '', '🕌');
     }
     modal.style.display = 'flex';
     document.body.style.overflow = 'hidden';
 }
 
-function previewImage(input) {
-    const preview = document.getElementById('imagePreview');
-    const container = document.getElementById('imagePreviewContainer');
+function previewSubjectImage(input) {
     if (input.files && input.files[0]) {
         const reader = new FileReader();
         reader.onload = function(e) {
-            preview.src = e.target.result;
-            container.style.display = 'block';
+            setPreview('subjectPreviewBox', e.target.result, '📖');
+        };
+        reader.readAsDataURL(input.files[0]);
+    }
+}
+
+function previewMarkazImage(input) {
+    if (input.files && input.files[0]) {
+        const reader = new FileReader();
+        reader.onload = function(e) {
+            setPreview('markazPreviewBox', e.target.result, '🕌');
         };
         reader.readAsDataURL(input.files[0]);
     }

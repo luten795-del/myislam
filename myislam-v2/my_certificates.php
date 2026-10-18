@@ -22,10 +22,30 @@ function initials(string $name): string {
     return $letters !== '' ? $letters : 'U';
 }
 function certTrackLabel(array $cert): string {
-    if (($cert['certification_type'] ?? '') === 'general') return 'General Certification - All Subjects';
-    return !empty($cert['subject_name']) ? $cert['subject_name'] . ' Subject Certification' : 'Subject Certification';
+    $type = (string)($cert['certification_type'] ?? '');
+    switch ($type) {
+        case 'general':
+            return 'General Certification - All Subjects';
+        case 'course':
+            return 'Course Certificate - Full Course Completion';
+        case 'division':
+            return 'Division Certificate - Semester Completed';
+        case 'subject':
+        default:
+            return !empty($cert['subject_name'])
+                ? $cert['subject_name'] . ' Subject Certification'
+                : 'Subject Certification';
+    }
 }
-function certIcon(array $cert): string { return (($cert['certification_type'] ?? '') === 'general') ? '🌍' : '📚'; }
+function certIcon(array $cert): string {
+    $type = (string)($cert['certification_type'] ?? '');
+    switch ($type) {
+        case 'general': return '🌍';
+        case 'course':  return '🏆';
+        case 'division':return '🎓';
+        default:        return '📚';
+    }
+}
 
 if (!isLoggedIn()) { header('Location: login.php'); exit; }
 $userId = (int)$_SESSION['user_id'];
@@ -46,8 +66,10 @@ $user = [
 
 $certificates = getUserCertificates($conn, $userId);
 $activeCount = count(array_filter($certificates, fn($c) => ($c['status'] ?? '') === 'active'));
-$generalCount = count(array_filter($certificates, fn($c) => ($c['certification_type'] ?? '') === 'general'));
-$subjectCount = count(array_filter($certificates, fn($c) => ($c['certification_type'] ?? '') === 'subject'));
+$generalCount  = count(array_filter($certificates, fn($c) => ($c['certification_type'] ?? '') === 'general'));
+$subjectCount  = count(array_filter($certificates, fn($c) => ($c['certification_type'] ?? '') === 'subject'));
+$divisionCount = count(array_filter($certificates, fn($c) => ($c['certification_type'] ?? '') === 'division'));
+$courseCount   = count(array_filter($certificates, fn($c) => ($c['certification_type'] ?? '') === 'course'));
 
 $unreadCount = 0;
 try {

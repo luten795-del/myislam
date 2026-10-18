@@ -547,6 +547,31 @@ function computeTopStreaks(PDO $conn, int $limit = 5): array {
     return array_slice($streaks, 0, $limit, true);
 }
 
+// Inserts a row and, if the table's `id` column has no AUTO_INCREMENT/default
+// (MySQL error 1364 "Field 'id' doesn't have a default value"), retries with
+// id = MAX(id)+1. Same workaround used elsewhere in this project for tables
+// like user_content_progress. Run this once to fix the root cause instead:
+//   ALTER TABLE audit_logs MODIFY id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT;
+//   ALTER TABLE user_activity_logs MODIFY id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT;
+function insertRow(PDO $conn, string $table, array $data): void
+{
+    $build = function (array $row) use ($table): string {
+        $cols = implode(', ', array_map(fn($c) => "`{$c}`", array_keys($row)));
+        $marks = implode(', ', array_fill(0, count($row), '?'));
+        return "INSERT INTO `{$table}` ({$cols}) VALUES ({$marks})";
+    };
+    try {
+        $conn->prepare($build($data))->execute(array_values($data));
+    } catch (PDOException $e) {
+        if (strpos($e->getMessage(), "'id' doesn't have a default value") === false) {
+            throw $e;
+        }
+        $nextId = (int)$conn->query("SELECT COALESCE(MAX(id), 0) + 1 FROM `{$table}`")->fetchColumn();
+        $data = ['id' => $nextId] + $data;
+        $conn->prepare($build($data))->execute(array_values($data));
+    }
+}
+
 // Handle POST actions
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? '';
@@ -556,10 +581,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $targetId = (int)$_POST['user_id'];
         $_SESSION['impersonator_id'] = $userId;
         $_SESSION['user_id'] = $targetId;
-        $logStmt = $conn->prepare("INSERT INTO user_activity_logs (user_id, action, description, ip_address) VALUES (?, 'impersonate', ?, ?)");
-        $logStmt->execute([$userId, "Admin impersonated user ID $targetId", $_SERVER['REMOTE_ADDR'] ?? '']);
-        $auditStmt = $conn->prepare("INSERT INTO audit_logs (actor_user_id, action, target_type, target_id, details, ip_address) VALUES (?, 'impersonate', 'user', ?, ?, ?)");
-        $auditStmt->execute([$userId, $targetId, "Started impersonating user #{$targetId}", $_SERVER['REMOTE_ADDR'] ?? '']);
+        insertRow($conn, 'user_activity_logs', [
+            'user_id' => $userId, 'action' => 'impersonate',
+            'description' => "Admin impersonated user ID $targetId", 'ip_address' => $_SERVER['REMOTE_ADDR'] ?? ''
+        ]);
+        insertRow($conn, 'audit_logs', [
+            'actor_user_id' => $userId, 'action' => 'impersonate', 'target_type' => 'user',
+            'target_id' => $targetId, 'details' => "Started impersonating user #{$targetId}", 'ip_address' => $_SERVER['REMOTE_ADDR'] ?? ''
+        ]);
         header('Location: ../user_dashboard.php');
         exit;
     }
@@ -571,8 +600,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $hash = password_hash($newPass, PASSWORD_DEFAULT);
             $stmt = $conn->prepare("UPDATE users SET password = ? WHERE id = ?");
             $stmt->execute([$hash, $targetId]);
-            $auditStmt = $conn->prepare("INSERT INTO audit_logs (actor_user_id, action, target_type, target_id, details, ip_address) VALUES (?, 'reset_password', 'user', ?, ?, ?)");
-            $auditStmt->execute([$userId, $targetId, "Password reset by admin", $_SERVER['REMOTE_ADDR'] ?? '']);
+            insertRow($conn, 'audit_logs', [
+                'actor_user_id' => $userId, 'action' => 'reset_password', 'target_type' => 'user',
+                'target_id' => $targetId, 'details' => 'Password reset by admin', 'ip_address' => $_SERVER['REMOTE_ADDR'] ?? ''
+            ]);
             $_SESSION['flash'] = ['type' => 'success', 'message' => 'Password reset successfully.'];
         }
         header('Location: automation.php?tab=users');
@@ -704,12 +735,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $summaryParts[] = "{$k}: {$v}";
             }
             $summary = implode(', ', $summaryParts);
-            $logStmt = $conn->prepare("INSERT INTO audit_logs (actor_user_id, action, target_type, target_id, details, ip_address) VALUES (?, 'bulk_reset_progress', 'user', ?, ?, ?)");
-            $logStmt->execute([
-                $userId,
-                $scope === 'one' ? $targetUserId : 0,
-                ($scope === 'one' ? "Single user #{$targetUserId}: " : "ALL USERS: ") . $summary,
-                $_SERVER['REMOTE_ADDR'] ?? ''
+            insertRow($conn, 'audit_logs', [
+                'actor_user_id' => $userId, 'action' => 'bulk_reset_progress', 'target_type' => 'user',
+                'target_id' => $scope === 'one' ? $targetUserId : 0,
+                'details' => ($scope === 'one' ? "Single user #{$targetUserId}: " : "ALL USERS: ") . $summary,
+                'ip_address' => $_SERVER['REMOTE_ADDR'] ?? ''
             ]);
 
             $conn->commit();
@@ -877,11 +907,21 @@ $totalExams = $conn->query("SELECT COUNT(*) FROM monthly_exams WHERE status = 'p
 $avgProgress = $conn->query("SELECT AVG(progress_percent) FROM user_content_progress")->fetchColumn();
 $avgProgress = $avgProgress ? round((float)$avgProgress, 1) : 0;
 
+// Does the users table have a `username` column? (checked once so the pages
+// never crash on a schema without it - the username simply shows as "-")
+$hasUsername = false;
+try {
+    $hasUsername = (bool)$conn->query("SHOW COLUMNS FROM users LIKE 'username'")->fetch();
+} catch (Throwable $e) {
+    $hasUsername = false;
+}
+$usernameSelect = $hasUsername ? 'u.username' : 'NULL';
+
 // Users tab
 $users = [];
 if ($tab === 'users') {
     $userStmt = $conn->query("
-        SELECT u.id, u.full_name, u.email, u.role, u.is_active,
+        SELECT u.id, u.full_name, {$usernameSelect} AS username, u.email, u.role, u.is_active,
                (SELECT COUNT(*) FROM user_content_progress WHERE user_id = u.id) AS lessons_started,
                (SELECT COUNT(*) FROM user_content_progress WHERE user_id = u.id AND is_completed = 1) AS lessons_completed,
                (SELECT COUNT(*) FROM quiz_attempts WHERE user_id = u.id) AS quizzes_taken,
@@ -1164,7 +1204,7 @@ if ($tab === 'health') {
 $resetStats = [];
 $resetUsersList = [];
 if ($tab === 'reset') {
-    $resetUsersList = $conn->query("SELECT id, full_name, email FROM users WHERE is_active = 1 ORDER BY full_name")->fetchAll();
+    $resetUsersList = $conn->query("SELECT u.id, u.full_name, {$usernameSelect} AS username, u.email FROM users u WHERE u.is_active = 1 ORDER BY u.full_name")->fetchAll();
     $resetTableMap = [
         'progress'      => 'user_content_progress',
         'quiz_attempts' => 'quiz_attempts',
@@ -1341,7 +1381,7 @@ if ($tab === 'categories') {
 
 // Notifications tab
 $recentNotifications = [];
-$allUsersForSelect = $conn->query("SELECT id, full_name FROM users WHERE is_active = 1 ORDER BY full_name")->fetchAll();
+$allUsersForSelect = $conn->query("SELECT u.id, u.full_name, {$usernameSelect} AS username FROM users u WHERE u.is_active = 1 ORDER BY u.full_name")->fetchAll();
 if ($tab === 'notifications') {
     $recentNotifications = $conn->query("
         SELECT n.*, u.full_name AS user_name
@@ -1360,7 +1400,8 @@ $mainNavigation = [
     ['name' => 'Quizzes', 'link' => 'admin_quizzes.php', 'active' => false],
     ['name' => 'Monthly Exams', 'link' => 'admin_monthly_exams.php', 'active' => false],
      ['name' => 'Certification Exams', 'link' => 'certification_exams.php', 'active' => false],    
-   
+        ['name' => 'Courses', 'link' => 'admin_courses.php', 'active' => false],
+
     ['name' => 'Multmedia', 'link' => 'admin_multmedia.php', 'active' => false],
     ['name' => 'adhkaar', 'link' => 'admin_adhkaar.php', 'active' => false],
      ['name' => 'Users', 'link' => 'admin_users.php', 'active' => false],
@@ -1379,44 +1420,72 @@ $mainNavigation = [
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>Developer Console – MyIslam</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
     <script>
-        // Apply saved theme before first paint so there's no light-mode flash.
+        // Apply saved theme before first paint so there's no flash.
+        // Dark is the default (same as admin_contents.php); only an explicit
+        // 'light' choice switches it. Shares the 'theme' key with the other admin pages.
         (function() {
-            const saved = localStorage.getItem('adminTheme');
-            if (saved === 'dark') document.documentElement.classList.add('dark-mode-init');
+            try {
+                const saved = localStorage.getItem('theme') || localStorage.getItem('adminTheme');
+                if (saved === 'light') document.documentElement.classList.add('light-init');
+            } catch (e) {}
         })();
     </script>
     <style>
-        /* Keep all your existing CSS here - unchanged */
+        /* ==========================================================
+           Shared admin theme - identical to admin_contents.php
+           (dark by default, light via body.light-mode)
+           ========================================================== */
         *{box-sizing:border-box;margin:0;padding:0}
+
         :root{
-        --bg:#f5f7f5;--surface:#ffffff;--surface-2:#f9fafb;--surface-3:#eef2f7;--line:#e5e7eb;
-        --text:#1f2937;--text-secondary:#4b5563;--muted:#6b7280;--brand:#166534;--brand-soft:#e7f3eb;
-        --accent:#3b82f6;--warning:#f59e0b;--danger:#ef4444;--success:#10b981;--header-bg:#e1f0e7;
-        --header-height:72px;--footer-height:92px;
-        --shadow-sm:0 1px 2px 0 rgb(0 0 0 / 0.05);--shadow-md:0 4px 6px -1px rgb(0 0 0 / 0.1);--shadow-lg:0 10px 15px -3px rgb(0 0 0 / 0.1);
-        --radius-sm:12px;--radius-md:16px;--radius-lg:20px;
+            --bg:#0f1720;--surface:#18212b;--surface-2:#1d2833;--surface-3:#22303c;--line:#304150;
+            --text:#edf2f7;--text-secondary:#cbd5e1;--muted:#94a3b8;
+            --brand:#4C9172;--brand-soft:rgba(76,145,114,.16);
+            --gold:#C9A85E;--gold-soft:rgba(201,168,94,.16);
+            --accent:#6FA0C4;--warning:#f59e0b;--danger:#ef4444;--success:#10b981;
+            --danger-soft:rgba(239,68,68,.12);--warning-soft:rgba(245,158,11,.12);
+            --success-soft:rgba(16,185,129,.12);--accent-soft:rgba(111,160,196,.16);
+            --header-bg:#13202a;--header-height:72px;--footer-height:92px;
+            --shadow-sm:0 1px 2px 0 rgb(0 0 0 / .3);--shadow-md:0 4px 6px -1px rgb(0 0 0 / .4);--shadow-lg:0 10px 15px -3px rgb(0 0 0 / .5);
+            --radius-sm:12px;--radius-md:16px;--radius-lg:20px;
         }
         body.dark-mode{
-        --bg:#0f1720;--surface:#18212b;--surface-2:#1d2833;--surface-3:#22303c;--line:#304150;
-        --text:#edf2f7;--text-secondary:#cbd5e1;--muted:#94a3b8;--brand:#7dd3a7;--brand-soft:rgba(125,211,167,0.12);
-        --accent:#60a5fa;--header-bg:#13202a;
+            --bg:#0f1720;--surface:#18212b;--surface-2:#1d2833;--surface-3:#22303c;--line:#304150;
+            --text:#edf2f7;--text-secondary:#cbd5e1;--muted:#94a3b8;
+            --brand:#4C9172;--brand-soft:rgba(76,145,114,.16);
+            --gold:#C9A85E;--gold-soft:rgba(201,168,94,.16);--accent:#6FA0C4;--accent-soft:rgba(111,160,196,.16);
+            --header-bg:#13202a;
         }
+        html.light-init, body.light-mode{
+            --bg:#f5f7f5;--surface:#ffffff;--surface-2:#f9fafb;--surface-3:#eef2f7;--line:#e5e7eb;
+            --text:#1f2937;--text-secondary:#4b5563;--muted:#6b7280;
+            --brand:#166534;--brand-soft:#e7f3eb;
+            --gold:#9C7A2E;--gold-soft:rgba(156,122,46,.10);
+            --accent:#3b82f6;--accent-soft:rgba(59,130,246,.12);
+            --header-bg:#e1f0e7;
+            --shadow-sm:0 1px 2px 0 rgb(0 0 0 / .05);--shadow-md:0 4px 6px -1px rgb(0 0 0 / .1);--shadow-lg:0 10px 15px -3px rgb(0 0 0 / .1);
+        }
+
         body{font-family:system-ui,-apple-system,'Segoe UI','Inter',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;line-height:1.5}
-        a{text-decoration:none;color:inherit} button,input,textarea{font:inherit}
+        a{text-decoration:none;color:inherit}
+        button,input,textarea,select{font:inherit}
+
+        /* ---------- Header ---------- */
         .app-header{position:fixed;top:0;left:0;right:0;z-index:1000;height:var(--header-height);background:var(--header-bg);border-bottom:1px solid var(--line);display:flex;align-items:center;justify-content:space-between;padding:12px 24px;backdrop-filter:blur(10px);gap:18px}
         .header-left,.header-right{display:flex;align-items:center;gap:12px}
         .header-left{flex:1;min-width:0}
         .header-top-nav{display:flex;align-items:center;gap:8px;overflow-x:auto}
         .header-top-link{height:42px;padding:0 14px;border-radius:999px;background:var(--surface);border:1px solid var(--line);display:inline-flex;align-items:center;justify-content:center;white-space:nowrap;font-size:13px;font-weight:700;transition:.2s}
         .header-top-link:hover,.header-top-link.active{background:var(--brand-soft);border-color:var(--brand);color:var(--brand)}
-        .menu-toggle,.icon-btn,.lang-btn,.brand-box{height:44px;min-width:44px;border-radius:var(--radius-sm);background:var(--surface);border:1px solid var(--line);display:inline-flex;align-items:center;justify-content:center;transition:.2s;cursor:pointer}
+        .menu-toggle,.icon-btn,.lang-btn,.brand-box{height:44px;min-width:44px;border-radius:var(--radius-sm);background:var(--surface);border:1px solid var(--line);display:inline-flex;align-items:center;justify-content:center;transition:.2s;cursor:pointer;color:var(--text)}
         .menu-toggle:hover,.icon-btn:hover,.lang-btn:hover,.profile-btn:hover{transform:translateY(-2px);box-shadow:var(--shadow-sm)}
-        .menu-toggle{font-size:22px}.lang-btn{min-width:56px;padding:0 14px;font-weight:600}
-        .brand-box{font-size:22px;font-weight:700;color:var(--brand);background:transparent;border:none;white-space:nowrap}
+        .menu-toggle{font-size:22px}
+        .lang-btn{min-width:56px;padding:0 14px;font-weight:600}
+        .brand-box{font-size:22px;font-weight:700;color:var(--brand);background:transparent;border:none;white-space:nowrap;cursor:default}
         .profile-area{position:relative}
         .profile-btn{width:44px;height:44px;border-radius:50%;overflow:hidden;background:var(--surface);border:2px solid var(--brand);cursor:pointer;padding:0;display:flex;align-items:center;justify-content:center;color:var(--brand);font-weight:700}
         .profile-btn img{width:100%;height:100%;object-fit:cover}
@@ -1429,142 +1498,110 @@ $mainNavigation = [
         .profile-menu-top p{font-size:12px;color:var(--muted)}
         .profile-menu a{display:block;padding:10px 12px;border-radius:var(--radius-sm);font-size:14px;transition:background .2s;margin:4px 0}
         .profile-menu a:hover{background:var(--brand-soft);color:var(--brand)}
+
+        /* ---------- Sidebar (slide-out drawer, same as admin_contents) ---------- */
         .sidebar-overlay{display:none;position:fixed;top:var(--header-height);left:0;width:100%;height:calc(100vh - var(--header-height));background:rgba(0,0,0,.5);z-index:1100;backdrop-filter:blur(4px)}
         .sidebar-overlay.show{display:block}
-        .sidebar{
-            position:sticky; top:var(--header-height); left:0; width:280px; min-width:280px; height:calc(100vh - var(--header-height));
-            background:linear-gradient(180deg,#0f3d22 0%, #114527 100%); color:#fff; border-right:1px solid rgba(255,255,255,0.08);
-            padding:20px 14px; z-index:1200; transition:left .3s ease; overflow-y:auto; box-shadow:var(--shadow-sm)
-        }
+        .sidebar{position:fixed;top:var(--header-height);left:-100%;width:320px;height:calc(100vh - var(--header-height));background:var(--surface);border-right:1px solid var(--line);padding:24px 20px;z-index:1200;transition:left .3s ease;overflow-y:auto}
         .sidebar.open{left:0}
         .sidebar-title{font-size:12px;color:var(--muted);text-transform:uppercase;margin-bottom:20px;font-weight:700;letter-spacing:1px;padding:0 8px}
-        .sidebar-brand{display:flex;align-items:center;gap:10px;font-size:18px;font-weight:800;padding:6px 10px 18px;color:#fff}
-        .sidebar-brand .dot{width:9px;height:9px;border-radius:50%;background:#4ade80;box-shadow:0 0 8px #4ade80;flex-shrink:0}
-        .sidebar-nav{display:flex;flex-direction:column;gap:4px}
-        .nav-section-label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.7px;color:rgba(255,255,255,.5);padding:16px 12px 6px}
-        .sidebar-nav a{
-            display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:10px;color:rgba(255,255,255,.9);
-            text-decoration:none;font-size:14px;font-weight:500;margin-bottom:2px;transition:all .15s ease;
-            border:1px solid transparent;background:rgba(255,255,255,0.02)
-        }
-        .sidebar-nav a:hover{background:rgba(255,255,255,.08);color:#fff;border-color:rgba(255,255,255,.08);transform:translateX(2px)}
-        .sidebar-nav a.active{background:#fff;color:#14532d;font-weight:700;border-color:#fff;box-shadow:0 8px 18px rgba(0,0,0,.12)}
-        .sidebar-nav a .ico{width:18px;text-align:center}
-        .subject-list{display:grid;gap:8px}
-        .subject-link{display:flex;align-items:center;gap:12px;padding:12px 16px;border-radius:var(--radius-md);background:var(--surface-2);border:1px solid transparent;font-size:14px;font-weight:500;transition:all .2s}
-        .subject-link:hover{background:var(--brand-soft);border-color:var(--brand);transform:translateX(4px)}
-        .subject-link.active{background:var(--brand-soft);color:var(--brand);border-color:var(--brand)}
-        .main-content{padding:calc(var(--header-height) + 24px) 24px calc(var(--footer-height) + 100px);max-width:1400px;margin:0 auto}
-        .page-stack{display:grid;gap:24px}
-        .section-card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius-lg);padding:24px;transition:.2s}
-        .section-card:hover{transform:translateY(-2px);box-shadow:var(--shadow-md)}
-        .hero-card{background:linear-gradient(135deg,var(--brand-soft) 0%,var(--surface) 100%);border:none;display:flex;justify-content:space-between;align-items:center}
-        .hero-card h1{font-size:32px;margin-bottom:8px;font-weight:700}
-        .hero-card p{color:var(--text-secondary);font-size:16px}
+        .sidebar-nav{display:grid;gap:8px}
+        .nav-section-label{font-size:11px;color:var(--muted);text-transform:uppercase;font-weight:700;letter-spacing:1px;padding:14px 8px 2px}
+        .sidebar-nav a{display:flex;align-items:center;gap:12px;padding:12px 16px;border-radius:var(--radius-md);background:var(--surface-2);border:1px solid transparent;font-size:14px;font-weight:500;color:var(--text);transition:all .2s}
+        .sidebar-nav a:hover{background:var(--brand-soft);border-color:var(--brand);transform:translateX(4px)}
+        .sidebar-nav a.active{background:var(--brand-soft);color:var(--brand);border-color:var(--brand)}
+        .sidebar-nav a .ico{width:20px;text-align:center}
+
+        /* ---------- Page layout ---------- */
+        .admin-shell{display:block;min-height:100vh}
+        .main{max-width:1600px;width:100%;margin:0 auto;padding:calc(var(--header-height) + 24px) 24px calc(var(--footer-height) + 100px)}
+        .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:12px}
+        h1{font-size:28px;font-weight:700;display:flex;align-items:center;gap:10px;color:var(--text)}
+        .page-subtitle{color:var(--text-secondary);font-size:14px;margin-top:2px}
+
+        /* ---------- Cards ---------- */
+        .card,.section-card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius-lg);padding:24px;margin-bottom:24px;transition:.2s}
+        .card:hover,.section-card:hover{transform:translateY(-2px);box-shadow:var(--shadow-md)}
+        .card h3{color:var(--text);margin-bottom:14px;font-size:17px;font-weight:700;display:flex;align-items:center;gap:8px}
+        .card .card-desc{color:var(--muted);font-size:13px;margin:-8px 0 14px}
+        .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:20px}
         .stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:20px}
-        .stat-card{text-align:center;padding:20px}
+        .stat-card{background:var(--surface-2);border:1px solid var(--line);border-radius:var(--radius-lg);padding:20px;text-align:center}
         .stat-value{font-size:32px;font-weight:800;color:var(--brand);margin-bottom:8px}
         .stat-label{font-size:13px;color:var(--muted)}
-        .filters-row{margin-bottom:16px}
-        .search-wrap{position:relative}
-        .search-input{width:100%;height:48px;border-radius:12px;border:1px solid var(--line);background:var(--surface-2);color:var(--text);padding:0 16px 0 46px;outline:none}
-        .search-input:focus{border-color:var(--brand);background:var(--surface);box-shadow:0 0 0 4px rgba(34,197,94,.08)}
-        .search-icon{position:absolute;left:16px;top:50%;transform:translateY(-50%);color:var(--muted);font-size:18px}
-        .subjects-list{display:grid;gap:12px}
-        .subject-item{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;padding:16px;background:var(--surface-2);border:1px solid var(--line);border-radius:16px}
-        .subject-left{display:flex;align-items:flex-start;gap:12px}
-        .subject-icon{width:46px;height:46px;border-radius:14px;background:var(--brand-soft);color:var(--brand);display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0}
-        .subject-name{font-size:16px;font-weight:800;margin-bottom:4px}
-        .subject-meta{font-size:12px;color:var(--muted);line-height:1.6}
-        .subject-actions{display:flex;gap:10px;flex-wrap:wrap}
-        .badge{display:inline-flex;align-items:center;justify-content:center;padding:6px 10px;border-radius:999px;font-size:11px;font-weight:700;background:var(--brand-soft);color:var(--brand)}
-        .badge.danger{background:rgba(239,68,68,.12);color:var(--danger)}
+        .hero-card{background:linear-gradient(135deg,var(--brand-soft) 0%,var(--surface) 100%);border:none;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:16px}
         .empty-state{text-align:center;padding:40px 20px;color:var(--muted)}
-        .btn{padding:10px 16px;border-radius:14px;font-weight:600;border:none;cursor:pointer;transition:.2s;font-size:13px;display:inline-flex;align-items:center;gap:6px}
+        .flash{background:var(--success);color:#fff;padding:14px 20px;border-radius:var(--radius-md);margin-bottom:20px;font-weight:600;box-shadow:var(--shadow-md)}
+        .flash.error,.flash.danger{background:var(--danger)}
+
+        /* ---------- Buttons ---------- */
+        .btn{padding:12px 20px;border-radius:14px;font-weight:700;font-size:14px;border:1px solid transparent;cursor:pointer;transition:.2s;display:inline-flex;align-items:center;gap:8px;background:var(--brand);color:#fff;text-decoration:none;margin:2px}
+        .btn:hover{transform:translateY(-2px);filter:brightness(1.08)}
         .btn.primary{background:var(--brand);color:#fff}
         .btn.secondary{background:var(--surface-2);border:1px solid var(--line);color:var(--text)}
-        .btn.warn{background:rgba(245,158,11,.12);color:var(--warning);border:1px solid rgba(245,158,11,.3)}
-        .btn.danger{background:rgba(239,68,68,.12);color:var(--danger);border:1px solid rgba(239,68,68,.3)}
-        .btn:hover{transform:translateY(-2px)}
-        .modal-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);z-index:2000;backdrop-filter:blur(6px);align-items:center;justify-content:center}
-        .modal{background:var(--surface);border-radius:var(--radius-lg);max-width:500px;width:90%;max-height:85vh;overflow-y:auto;box-shadow:var(--shadow-lg);border:1px solid var(--line)}
-        .modal-header{padding:24px 24px 16px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}
-        .modal-header h2{font-size:20px;font-weight:700}
-        .modal-close{background:none;border:none;font-size:28px;cursor:pointer;color:var(--muted)}
-        .modal-body{padding:24px}
-        .form-fields{display:grid;gap:14px}
-        .form-row{display:grid;gap:8px}
-        .form-row label{font-size:14px;font-weight:700}
-        .form-input,.form-textarea{width:100%;border-radius:12px;border:1px solid var(--line);background:var(--surface-2);color:var(--text);padding:12px 14px;outline:none}
-        .form-input:focus,.form-textarea:focus{border-color:var(--brand);background:var(--surface);box-shadow:0 0 0 4px rgba(34,197,94,.08)}
-        .form-textarea{min-height:80px;resize:vertical}
-        .inline-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-        .check-row{display:flex;align-items:center;gap:10px;padding-top:6px}
-        .check-row input{width:18px;height:18px}
-        .action-row{display:flex;gap:12px;flex-wrap:wrap;margin-top:16px}
-        .toast-container{position:fixed;top:80px;right:20px;z-index:9999;display:flex;flex-direction:column;gap:10px}
-        .toast{padding:16px 20px;border-radius:var(--radius-md);background:var(--success);color:#fff;box-shadow:var(--shadow-lg);font-weight:500;display:flex;align-items:center;gap:10px;animation:slideIn 0.3s ease;max-width:400px}
-        .toast.success{background:#10b981}
-        .toast.danger{background:#ef4444}
-        .toast .close-toast{margin-left:auto;cursor:pointer;font-size:20px;opacity:0.8}
-        @keyframes slideIn{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}
-
-        @media (max-width:1200px){.stats-grid{grid-template-columns:repeat(2,1fr)}}
-        @media (max-width:900px){.header-top-nav{display:none}}
-        @media (max-width:768px){
-        :root{--header-height:64px;--footer-height:80px}
-        .main-content{padding:calc(var(--header-height) + 16px) 16px calc(var(--footer-height) + 80px)}
-        .section-card{padding:16px}.hero-card h1{font-size:24px}.stats-grid,.inline-row{grid-template-columns:1fr;gap:12px}.subject-item{flex-direction:column}
-        }
-
-        /* Compatibility layer for the larger dashboard widgets already in the page */
+        .btn.warn,.btn-warning{background:rgba(245,158,11,.12);color:var(--warning);border:1px solid rgba(245,158,11,.3)}
+        .btn.danger,.btn-danger{background:rgba(239,68,68,.12);color:var(--danger);border:1px solid rgba(239,68,68,.3)}
+        .btn.danger:hover,.btn-danger:hover,.btn.warn:hover,.btn-warning:hover{filter:none;background:rgba(239,68,68,.2)}
+        .btn-sm{padding:6px 12px;font-size:12px}
+        .btn-outline{background:transparent;color:var(--brand);border:1px solid var(--brand)}
+        .btn-outline:hover{background:var(--brand-soft);color:var(--brand);filter:none}
         .theme-toggle{display:flex;align-items:center;gap:8px;background:var(--surface-2);border:1px solid var(--line);border-radius:40px;padding:7px 14px;font-size:13px;font-weight:600;cursor:pointer;color:var(--text)}
         .theme-toggle:hover{background:var(--brand-soft)}
-        .admin-shell{display:flex;min-height:100vh;align-items:stretch}
-        .main{flex:1;min-width:0;padding:26px 30px 60px;max-width:1500px}
-        .topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:12px}
-        h1{font-size:24px;display:flex;align-items:center;gap:10px;color:var(--brand)}
-        .page-subtitle{color:var(--muted);font-size:13.5px;margin-top:2px}
-        .flash{background:var(--success);color:#fff;padding:12px 20px;border-radius:var(--radius-md);margin-bottom:20px;font-weight:600}
-        .flash.error{background:var(--danger)}
-        .card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius-md);padding:24px;box-shadow:var(--shadow-sm);margin-bottom:22px;transition:box-shadow .2s}
-        .card:hover{box-shadow:var(--shadow-md)}
-        .card h3{color:var(--brand);margin-bottom:14px;font-size:16.5px;display:flex;align-items:center;gap:8px}
-        .card .card-desc{color:var(--muted);font-size:13px;margin:-8px 0 14px}
-        .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px}
-        .stat-card{background:var(--brand-soft);border-radius:var(--radius-md);padding:20px;text-align:center}
-        .stat-value{font-size:32px;font-weight:800;color:var(--brand)}
-        .stat-label{color:var(--muted);font-size:13px}
-        table{width:100%;border-collapse:collapse;background:var(--surface);border-radius:var(--radius-md);overflow:hidden;box-shadow:var(--shadow-sm)}
-        th,td{padding:11px 15px;text-align:left;border-bottom:1px solid var(--line);font-size:13.5px}
+
+        /* ---------- Forms ---------- */
+        .form-fields{display:grid;gap:14px}
+        .form-row,.form-group{display:grid;gap:8px;margin-bottom:16px}
+        .form-row{margin-bottom:0}
+        label{display:block;font-size:14px;font-weight:700}
+        input,select,textarea{width:100%;padding:12px 14px;border-radius:12px;border:1px solid var(--line);background:var(--surface-2);color:var(--text);font-size:14px;outline:none}
+        input:focus,select:focus,textarea:focus{border-color:var(--brand);background:var(--surface);box-shadow:0 0 0 4px rgba(34,197,94,.08);outline:none}
+        input[type="checkbox"],input[type="radio"]{width:18px;height:18px;padding:0;accent-color:var(--brand)}
+        textarea{min-height:80px;resize:vertical}
+        .form-input,.form-textarea,.form-select{width:100%}
+        .inline-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+        .check-row,.checkbox-row{display:flex;align-items:center;gap:10px;padding-top:6px}
+        .check-row input,.checkbox-row input{width:18px;height:18px;flex-shrink:0}
+        .action-row{display:flex;gap:12px;flex-wrap:wrap;margin-top:16px}
+        .flex{display:flex;gap:16px;flex-wrap:wrap}
+
+        /* ---------- Tables ---------- */
+        table{width:100%;border-collapse:collapse;background:var(--surface);border-radius:var(--radius-md);overflow:hidden}
+        th,td{padding:12px 15px;text-align:left;border-bottom:1px solid var(--line);font-size:13.5px}
         th{background:var(--brand-soft);font-weight:700;color:var(--brand);text-transform:uppercase;font-size:11.5px;letter-spacing:.3px}
         table tbody tr:nth-child(even){background:var(--surface-2)}
         table tbody tr:hover{background:var(--brand-soft)}
-        .btn{display:inline-block;padding:8px 16px;border-radius:40px;font-weight:600;font-size:13.5px;background:var(--brand);color:#fff;border:none;cursor:pointer;text-decoration:none;transition:all .2s;margin:2px}
-        .btn:hover{background:#0f4d2d}
-        .btn-sm{padding:4px 10px;font-size:12px}
-        .btn-outline{background:transparent;color:var(--brand);border:1px solid var(--brand)}
-        .btn-outline:hover{background:var(--brand-soft);color:var(--brand)}
-        .btn-danger{background:var(--danger)}
-        .btn-warning{background:var(--warning)}
-        .modal-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);z-index:1000;align-items:center;justify-content:center}
-        .modal{background:var(--surface);border-radius:var(--radius-md);padding:24px;max-width:500px;width:90%;max-height:80vh;overflow:auto}
-        .modal-header{display:flex;justify-content:space-between;margin-bottom:16px}
-        .close-btn{background:none;border:none;font-size:24px;cursor:pointer}
-        .form-group{margin-bottom:16px}
-        label{display:block;margin-bottom:4px;font-weight:600;font-size:13.5px}
-        input,select,textarea{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:9px;font-size:14px;background:var(--surface-2)}
-        input:focus,select:focus,textarea:focus{outline:2px solid var(--brand-soft);border-color:var(--brand)}
-        .flex{display:flex;gap:16px;flex-wrap:wrap}
-        .badge{display:inline-block;padding:2px 10px;border-radius:40px;font-size:12px;font-weight:600}
-        .badge-success{background:#d1fae5;color:#065f46}
-        .badge-warning{background:#fef3c7;color:#92400e}
-        .badge-info{background:#dbeafe;color:#1e40af}
-        .badge-danger{background:rgba(239,68,68,.12);color:#991b1b}
-        .log-entry{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:13px;padding:9px 0;border-bottom:1px solid var(--line)}
+
+        /* ---------- Badges ---------- */
+        .badge{display:inline-flex;align-items:center;justify-content:center;padding:6px 10px;border-radius:999px;font-size:11px;font-weight:700;background:var(--brand-soft);color:var(--brand)}
+        .badge.danger,.badge-danger{background:var(--danger-soft);color:var(--danger)}
+        .badge-success{background:var(--success-soft);color:var(--success)}
+        .badge-warning{background:var(--warning-soft);color:var(--warning)}
+        .badge-info{background:var(--accent-soft);color:var(--accent)}
+
+        /* ---------- Modals ---------- */
+        .modal-overlay{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.6);z-index:2000;backdrop-filter:blur(6px);align-items:center;justify-content:center}
+        .modal{background:var(--surface);border-radius:var(--radius-lg);max-width:500px;width:90%;max-height:85vh;overflow-y:auto;box-shadow:var(--shadow-lg);border:1px solid var(--line);padding:24px}
+        .modal-header{display:flex;justify-content:space-between;align-items:center;padding-bottom:16px;margin-bottom:16px;border-bottom:1px solid var(--line)}
+        .modal-header h2,.modal-header h3{font-size:20px;font-weight:700}
+        .modal-close,.close-btn{background:none;border:none;font-size:28px;cursor:pointer;color:var(--muted);padding:0 8px;width:auto}
+        .modal-body{padding:0}
+
+        /* ---------- Toasts ---------- */
+        .toast-container{position:fixed;top:80px;right:20px;z-index:9999;display:flex;flex-direction:column;gap:10px}
+        .toast{padding:16px 20px;border-radius:var(--radius-md);background:var(--success);color:#fff;box-shadow:var(--shadow-lg);font-weight:500;display:flex;align-items:center;gap:10px;animation:slideIn .3s ease;max-width:400px}
+        .toast.success{background:#10b981}
+        .toast.danger{background:#ef4444}
+        .toast .close-toast{margin-left:auto;cursor:pointer;font-size:20px;opacity:.8}
+        @keyframes slideIn{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}
+
+        /* ==========================================================
+           Dashboard-specific widgets (restyled with the shared tokens)
+           ========================================================== */
+        .log-entry{display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:13px;padding:10px 0;border-bottom:1px solid var(--line)}
         .log-entry .log-meta{color:var(--muted);font-size:12px}
-        .podium-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:18px;margin-bottom:24px}
-        .podium-card{background:var(--surface);border-radius:18px;padding:22px;box-shadow:var(--shadow-sm);position:relative;overflow:hidden;border:1px solid var(--line)}
+        .podium-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:20px;margin-bottom:24px}
+        .podium-card{background:var(--surface);border-radius:var(--radius-lg);padding:22px;position:relative;overflow:hidden;border:1px solid var(--line);transition:.2s}
+        .podium-card:hover{transform:translateY(-2px);box-shadow:var(--shadow-md)}
         .podium-card::before{content:'';position:absolute;top:0;left:0;right:0;height:5px}
         .podium-card.gold::before{background:linear-gradient(90deg,#fbbf24,#f59e0b)}
         .podium-card.silver::before{background:linear-gradient(90deg,#a78bfa,#7c3aed)}
@@ -1575,41 +1612,46 @@ $mainNavigation = [
         .podium-metric{font-size:14px;color:var(--brand);font-weight:700}
         .podium-empty{color:var(--muted);font-size:14px;padding:8px 0}
         .angle-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}
-        .angle-card{background:var(--brand-soft);border-radius:14px;padding:16px 18px}
+        .angle-card{background:var(--surface-2);border:1px solid var(--line);border-radius:var(--radius-md);padding:16px 18px}
         .angle-label{font-size:12px;color:var(--muted);font-weight:700;text-transform:uppercase;margin-bottom:4px}
         .angle-value{font-size:16px;font-weight:700;color:var(--brand)}
         .chart-card canvas{max-height:320px}
         .chart-toolbar{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:14px}
         .chart-toolbar select{width:auto;min-width:220px}
         .period-filter{display:flex;gap:6px;flex-wrap:wrap}
-        .period-pill{padding:6px 14px;border-radius:999px;background:var(--surface);border:1px solid var(--line);color:var(--text);font-size:13px;font-weight:600;cursor:pointer;transition:all .15s}
+        .period-pill{padding:6px 14px;border-radius:999px;background:var(--surface-2);border:1px solid var(--line);color:var(--text);font-size:13px;font-weight:600;cursor:pointer;transition:all .15s}
         .period-pill.active{background:var(--brand);border-color:var(--brand);color:#fff}
         .period-pill:hover:not(.active){background:var(--brand-soft);border-color:var(--brand);color:var(--brand)}
         .custom-range-row{display:flex;align-items:center;gap:8px;margin-bottom:12px;flex-wrap:wrap}
-        .custom-range-row input[type="date"]{width:auto;padding:6px 10px}
-        .device-pill{display:inline-flex;align-items:center;gap:4px;font-size:11.5px;padding:2px 9px;border-radius:20px;background:#fef3c7;color:#92400e;font-weight:700}
-        .device-pill-danger{background:rgba(239,68,68,.12);color:#991b1b}
-        .security-warning-banner{display:flex;gap:16px;background:rgba(239,68,68,.12);border:1px solid #fca5a5;border-radius:var(--radius-md);padding:20px;margin-bottom:22px}
+        .custom-range-row input[type="date"]{width:auto;padding:8px 12px}
+        .device-pill{display:inline-flex;align-items:center;gap:4px;font-size:11.5px;padding:2px 9px;border-radius:20px;background:var(--warning-soft);color:var(--warning);font-weight:700}
+        .device-pill-danger{background:var(--danger-soft);color:var(--danger)}
+        .security-warning-banner{display:flex;gap:16px;background:var(--danger-soft);border:1px solid rgba(239,68,68,.35);border-radius:var(--radius-lg);padding:20px;margin-bottom:22px}
         .security-warning-icon{font-size:32px;flex-shrink:0}
-        .security-warning-body h3{color:#7f1d1d;margin-bottom:6px}
-        .security-warning-body p{color:#7f1d1d;font-size:14px;line-height:1.6}
-        .device-session-row{border:1px solid var(--line);border-radius:var(--radius-md);padding:14px 16px;margin-bottom:10px;background:var(--surface)}
-        .device-session-row.concurrent{border-color:var(--danger);background:rgba(239,68,68,.12)}
+        .security-warning-body h3{color:var(--danger);margin-bottom:6px}
+        .security-warning-body p{color:var(--text-secondary);font-size:14px;line-height:1.6}
+        .device-session-row{border:1px solid var(--line);border-radius:var(--radius-md);padding:14px 16px;margin-bottom:10px;background:var(--surface-2)}
+        .device-session-row.concurrent{border-color:var(--danger);background:var(--danger-soft)}
         .device-session-user{font-weight:700;font-size:15px}
         .device-session-meta{font-size:12px;color:var(--muted);margin-top:2px}
         .device-session-item{font-size:13px;padding:8px 0;border-top:1px dashed var(--line);margin-top:8px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
         .impersonate-bar{background:var(--warning);color:#000;padding:8px 20px;border-radius:40px;display:inline-block;margin-bottom:16px;font-weight:600}
         .impersonate-bar a{margin-left:16px;color:#000;text-decoration:underline}
+        .reset-stat{background:var(--surface-2);border:1px solid var(--line);border-radius:var(--radius-md);padding:14px;text-align:center}
+        .reset-stat .value{font-size:24px;font-weight:800;color:var(--brand)}
+        .reset-stat .label{font-size:12px;color:var(--muted)}
         .question-img{max-width:200px;max-height:150px;margin:8px 0;border-radius:8px}
         .option-img{max-width:100px;max-height:80px;margin-left:8px;vertical-align:middle}
-        @media (max-width:900px){
-            .admin-shell{flex-direction:column}
-            .sidebar{position:fixed; top:var(--header-height); left:-100%; width:320px; min-width:320px; height:calc(100vh - var(--header-height)); background:linear-gradient(180deg,var(--brand) 0%, #0f3d22 100%); padding:24px 20px;}
-            .sidebar.open{left:0}
-            .sidebar-nav{display:flex;flex-direction:column;overflow-x:auto;gap:4px;padding-bottom:4px}
-            .nav-section-label{display:block}
-            .sidebar-nav a{white-space:normal}
-            .main{padding:18px}
+
+        /* ---------- Responsive (same breakpoints as admin_contents) ---------- */
+        @media(max-width:1200px){.stats-grid{grid-template-columns:repeat(2,1fr)}}
+        @media(max-width:950px){.header-top-nav{display:none}}
+        @media(max-width:768px){
+            :root{--header-height:64px;--footer-height:80px}
+            .main{padding:calc(var(--header-height) + 16px) 16px calc(var(--footer-height) + 80px)}
+            .card,.section-card{padding:16px}
+            .stats-grid,.inline-row{grid-template-columns:1fr;gap:12px}
+            h1{font-size:24px}
         }
     </style>
 <?php include __DIR__ . '/../includes/pwa.php'; ?>
@@ -1666,7 +1708,7 @@ $mainNavigation = [
     <div class="admin-shell">
         <div class="sidebar-overlay" id="sidebarOverlay"></div>
         <aside class="sidebar" id="sidebar">
-            <div class="sidebar-brand"><span class="dot"></span> Developer Console</div>
+            <div class="sidebar-title">🛠️ Developer Console</div>
             <nav class="sidebar-nav">
                 <div class="nav-section-label">Overview</div>
                 <a href="?tab=dashboard" class="<?= $tab=='dashboard'?'active':'' ?>"><span class="ico">📊</span> Dashboard</a>
@@ -1796,7 +1838,7 @@ $mainNavigation = [
             <select id="userChartSelect">
                 <option value="">Select a user…</option>
                 <?php foreach ($allUsersForSelect as $u): ?>
-                    <option value="<?= (int)$u['id'] ?>"><?= e($u['full_name']) ?></option>
+                    <option value="<?= (int)$u['id'] ?>"><?= e($u['full_name']) ?><?= !empty($u['username']) ? ' (@' . e($u['username']) . ')' : '' ?></option>
                 <?php endforeach; ?>
             </select>
         </div>
@@ -1892,12 +1934,13 @@ $mainNavigation = [
         <h3>User Management</h3>
         <div style="overflow-x:auto;">
             <table>
-                <thead><tr><th>ID</th><th>Name</th><th>Email</th><th>Role</th><th>Lessons</th><th>Quizzes</th><th>Exams</th><th>Points</th><th>Actions</th></tr></thead>
+                <thead><tr><th>ID</th><th>Name</th><th>Username</th><th>Email</th><th>Role</th><th>Lessons</th><th>Quizzes</th><th>Exams</th><th>Points</th><th>Actions</th></tr></thead>
                 <tbody>
                 <?php foreach ($users as $u): ?>
                 <tr>
                     <td><?= $u['id'] ?></td>
                     <td><?= e($u['full_name']) ?></td>
+                    <td><?= !empty($u['username']) ? '@' . e($u['username']) : '—' ?></td>
                     <td><?= e($u['email']) ?></td>
                     <td><span class="badge <?= $u['role']==='admin'?'badge-warning':'' ?>"><?= $u['role'] ?></span></td>
                     <td><?= $u['lessons_completed'] ?>/<?= $u['lessons_started'] ?></td>
@@ -1975,14 +2018,14 @@ $mainNavigation = [
         
         <h4>Questions & Correct Answers</h4>
         <?php foreach ($questions as $idx => $q): ?>
-        <div style="background:#f9fafb; padding:16px; border-radius:8px; margin-bottom:12px;">
+        <div style="background:var(--surface-2); padding:16px; border-radius:8px; margin-bottom:12px;">
             <p><strong>Q<?= $idx+1 ?>:</strong> <?= e($q['question_text']) ?></p>
             <?php if (!empty($q['image_path'])): ?>
                 <img src="<?= e($q['image_path']) ?>" class="question-img" alt="Question image">
             <?php endif; ?>
             
             <?php if ($detailType === 'quiz'): ?>
-                <p><span style="color:#166534;">✓ Correct:</span> 
+                <p><span style="color:var(--brand);">✓ Correct:</span> 
                     <?php 
                     $correctTexts = [];
                     foreach ($q['options'] as $opt) {
@@ -2005,7 +2048,7 @@ $mainNavigation = [
                 </div>
             <?php else: ?>
                 <?php if ($q['question_type'] !== 'explanation'): ?>
-                    <p><span style="color:#166534;">✓ Correct:</span> 
+                    <p><span style="color:var(--brand);">✓ Correct:</span> 
                         <?php 
                         $correctTexts = [];
                         foreach ($q['options'] as $opt) {
@@ -2026,7 +2069,7 @@ $mainNavigation = [
                         </ul>
                     </div>
                 <?php else: ?>
-                    <p><span style="color:#166534;">Expected Answer:</span> <?= e($q['expected_answer'] ?? 'N/A') ?></p>
+                    <p><span style="color:var(--brand);">Expected Answer:</span> <?= e($q['expected_answer'] ?? 'N/A') ?></p>
                 <?php endif; ?>
                 <?php if (!empty($q['explanation'])): ?>
                     <p><small>💡 <?= e($q['explanation']) ?></small></p>
@@ -2215,7 +2258,7 @@ $mainNavigation = [
                 <select name="target_user_id">
                     <option value="">-- Select User --</option>
                     <?php foreach ($allUsersForSelect as $u): ?>
-                    <option value="<?= $u['id'] ?>"><?= e($u['full_name']) ?></option>
+                    <option value="<?= $u['id'] ?>"><?= e($u['full_name']) ?><?= !empty($u['username']) ? ' (@' . e($u['username']) . ')' : '' ?></option>
                     <?php endforeach; ?>
                 </select>
             </div>
@@ -2357,7 +2400,7 @@ $mainNavigation = [
             <p><strong>#<?= $t['id'] ?> - <?= e($t['subject']) ?></strong> by <?= e($t['user_name']) ?> (<?= $t['status'] ?>)</p>
             <p><?= nl2br(e($t['message'])) ?></p>
             <?php if ($t['admin_response']): ?>
-                <p style="background:#e7f3eb; padding:8px; border-radius:8px;"><strong>Response:</strong> <?= nl2br(e($t['admin_response'])) ?></p>
+                <p style="background:var(--brand-soft); padding:8px; border-radius:8px;"><strong>Response:</strong> <?= nl2br(e($t['admin_response'])) ?></p>
             <?php endif; ?>
             <form method="post" style="margin-top:12px;">
                 <input type="hidden" name="action" value="respond_ticket">
@@ -2538,7 +2581,7 @@ $mainNavigation = [
                 <select name="target_user_id" id="reset_target_user_id">
                     <option value="">-- Choose a user --</option>
                     <?php foreach ($resetUsersList as $ru): ?>
-                        <option value="<?= (int)$ru['id'] ?>"><?= e($ru['full_name']) ?> (<?= e($ru['email']) ?>) [ID: <?= (int)$ru['id'] ?>]</option>
+                        <option value="<?= (int)$ru['id'] ?>"><?= e($ru['full_name']) ?><?= !empty($ru['username']) ? ' (@' . e($ru['username']) . ')' : '' ?> - <?= e($ru['email']) ?> [ID: <?= (int)$ru['id'] ?>]</option>
                     <?php endforeach; ?>
                 </select>
             </div>
@@ -2584,8 +2627,8 @@ $mainNavigation = [
 
     <div class="grid" style="margin-bottom:22px;">
         <div class="stat-card" style="background:var(--danger-soft);"><div class="stat-value" style="color:var(--danger);"><?= (int)$errorStats['error'] ?></div><div class="stat-label">Errors (last 100)</div></div>
-        <div class="stat-card" style="background:#fef3c7;"><div class="stat-value" style="color:#92400e;"><?= (int)$errorStats['warning'] ?></div><div class="stat-label">Warnings (last 100)</div></div>
-        <div class="stat-card" style="background:#dbeafe;"><div class="stat-value" style="color:#1e40af;"><?= (int)$errorStats['notice'] ?></div><div class="stat-label">Notices (last 100)</div></div>
+        <div class="stat-card" style="background:var(--warning-soft);"><div class="stat-value" style="color:var(--warning);"><?= (int)$errorStats['warning'] ?></div><div class="stat-label">Warnings (last 100)</div></div>
+        <div class="stat-card" style="background:var(--accent-soft);"><div class="stat-value" style="color:var(--accent);"><?= (int)$errorStats['notice'] ?></div><div class="stat-label">Notices (last 100)</div></div>
     </div>
 
     <div class="card">
@@ -2689,8 +2732,9 @@ $mainNavigation = [
 
     function applyTheme(isDark) {
         body.classList.toggle('dark-mode', isDark);
+        body.classList.toggle('light-mode', !isDark);
         if (toggle) {
-            toggle.textContent = isDark ? '☀️' : '🌙';
+            toggle.textContent = isDark ? '☀' : '🌙';
             toggle.setAttribute('aria-label', isDark ? 'Switch to light mode' : 'Switch to dark mode');
         }
     }
@@ -2719,14 +2763,16 @@ $mainNavigation = [
         }
     });
 
-    const savedTheme = localStorage.getItem('adminTheme') || localStorage.getItem('theme');
-    applyTheme(savedTheme === 'dark');
+    const savedTheme = localStorage.getItem('theme') || localStorage.getItem('adminTheme');
+    applyTheme(savedTheme !== 'light');   // dark by default
 
     if (toggle) {
         toggle.addEventListener('click', () => {
             const isDark = !body.classList.contains('dark-mode');
             applyTheme(isDark);
+            localStorage.setItem('theme', isDark ? 'dark' : 'light');
             localStorage.setItem('adminTheme', isDark ? 'dark' : 'light');
+            document.documentElement.classList.remove('light-init');
         });
     }
 
@@ -2760,7 +2806,13 @@ $mainNavigation = [
 <?php if ($tab === 'dashboard'): ?>
 // ===== Dashboard line charts (period-aware: day/week/month/year/custom) =====
 (function() {
-    const chartColors = { lessons: '#166534', quizzes: '#0284c7', logins: '#f59e0b', cumulative: '#166534', quizAvg: '#7c3aed' };
+    const chartColors = { lessons: '#4C9172', quizzes: '#0284c7', logins: '#f59e0b', cumulative: '#4C9172', quizAvg: '#7c3aed' };
+    // Chart axis text / grid lines follow the active theme (read on page load)
+    if (window.Chart) {
+        const cs = getComputedStyle(document.body);
+        Chart.defaults.color = cs.getPropertyValue('--muted').trim() || '#94a3b8';
+        Chart.defaults.borderColor = cs.getPropertyValue('--line').trim() || '#304150';
+    }
     const periodLabels = { day: 'Today.', week: 'Last 7 days.', month: 'This month.', year: 'This year.', custom: 'Custom range.' };
 
     let systemChartInstance = null;

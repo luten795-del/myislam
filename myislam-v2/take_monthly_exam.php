@@ -1,5 +1,5 @@
 <?php
-
+declare(strict_types=1);
 session_start();
 date_default_timezone_set('Africa/Dar_es_Salaam');
 
@@ -67,7 +67,11 @@ function getUnreadCount(PDO $conn, int $userId): int
 function getMonthlyExam(PDO $conn, int $examId): ?array
 {
     if ($examId <= 0) return null;
-    $stmt = $conn->prepare("SELECT * FROM monthly_exams WHERE id = ? AND status = 'published' LIMIT 1");
+    $stmt = $conn->prepare("
+        SELECT * FROM monthly_exams
+        WHERE id = ? AND status = 'published' AND allow_access = 1
+        LIMIT 1
+    ");
     $stmt->execute([$examId]);
     $exam = $stmt->fetch(PDO::FETCH_ASSOC);
     return $exam ?: null;
@@ -181,17 +185,36 @@ function buildReviewFromAttempt(array $attempt, array $questions): array
     ];
 }
 
-function latestCompletedAttempt(PDO $conn, int $examId, int $userId): ?array
+/* ============================================================
+ * PATCH 3 + 4 + 1b: scope-aware attempt lookups
+ * When $attemptCourseId > 0, scope by course_id.
+ * When null/0 (legacy course-less exam), fall back to user+exam.
+ * ============================================================ */
+
+function latestCompletedAttempt(PDO $conn, int $examId, int $userId, ?int $attemptCourseId = null): ?array
 {
     try {
-        $stmt = $conn->prepare("
-            SELECT *
-            FROM monthly_exam_attempts
-            WHERE user_id = ? AND exam_id = ? AND status IN ('completed', 'abandoned', 'terminated')
-            ORDER BY completed_at DESC, id DESC
-            LIMIT 1
-        ");
-        $stmt->execute([$userId, $examId]);
+        if ($attemptCourseId !== null && $attemptCourseId > 0) {
+            $stmt = $conn->prepare("
+                SELECT *
+                FROM monthly_exam_attempts
+                WHERE user_id = ? AND exam_id = ? AND course_id = ?
+                  AND status IN ('completed', 'abandoned', 'terminated')
+                ORDER BY completed_at DESC, id DESC
+                LIMIT 1
+            ");
+            $stmt->execute([$userId, $examId, $attemptCourseId]);
+        } else {
+            $stmt = $conn->prepare("
+                SELECT *
+                FROM monthly_exam_attempts
+                WHERE user_id = ? AND exam_id = ?
+                  AND status IN ('completed', 'abandoned', 'terminated')
+                ORDER BY completed_at DESC, id DESC
+                LIMIT 1
+            ");
+            $stmt->execute([$userId, $examId]);
+        }
         $attempt = $stmt->fetch(PDO::FETCH_ASSOC);
         return $attempt ?: null;
     } catch (Throwable $e) {
@@ -200,16 +223,27 @@ function latestCompletedAttempt(PDO $conn, int $examId, int $userId): ?array
     }
 }
 
-function getOpenAttempt(PDO $conn, int $examId, int $userId): ?array
+function getOpenAttempt(PDO $conn, int $examId, int $userId, ?int $attemptCourseId = null): ?array
 {
-    $stmt = $conn->prepare("
-        SELECT *
-        FROM monthly_exam_attempts
-        WHERE user_id = ? AND exam_id = ? AND status = 'started'
-        ORDER BY id DESC
-        LIMIT 1
-    ");
-    $stmt->execute([$userId, $examId]);
+    if ($attemptCourseId !== null && $attemptCourseId > 0) {
+        $stmt = $conn->prepare("
+            SELECT *
+            FROM monthly_exam_attempts
+            WHERE user_id = ? AND exam_id = ? AND course_id = ? AND status = 'started'
+            ORDER BY id DESC
+            LIMIT 1
+        ");
+        $stmt->execute([$userId, $examId, $attemptCourseId]);
+    } else {
+        $stmt = $conn->prepare("
+            SELECT *
+            FROM monthly_exam_attempts
+            WHERE user_id = ? AND exam_id = ? AND status = 'started'
+            ORDER BY id DESC
+            LIMIT 1
+        ");
+        $stmt->execute([$userId, $examId]);
+    }
     $attempt = $stmt->fetch(PDO::FETCH_ASSOC);
     return $attempt ?: null;
 }
@@ -222,23 +256,49 @@ function getAttemptById(PDO $conn, int $attemptId, int $userId): ?array
     return $attempt ?: null;
 }
 
-function countAttemptsInWindow(PDO $conn, int $examId, int $userId, string $startDate, string $endDate): int
-{
-    $stmt = $conn->prepare("
-        SELECT COUNT(*)
-        FROM monthly_exam_attempts
-        WHERE user_id = ? AND exam_id = ?
-          AND created_at BETWEEN ? AND ?
-          AND status IN ('started','completed','abandoned','terminated')
-    ");
-    $stmt->execute([$userId, $examId, $startDate, $endDate]);
+function countAttemptsInWindow(
+    PDO $conn,
+    int $examId,
+    int $userId,
+    string $startDate,
+    string $endDate,
+    ?int $attemptCourseId = null
+): int {
+    if ($attemptCourseId !== null && $attemptCourseId > 0) {
+        $stmt = $conn->prepare("
+            SELECT COUNT(*)
+            FROM monthly_exam_attempts
+            WHERE user_id = ? AND exam_id = ? AND course_id = ?
+              AND created_at BETWEEN ? AND ?
+              AND status IN ('started','completed','abandoned','terminated')
+        ");
+        $stmt->execute([$userId, $examId, $attemptCourseId, $startDate, $endDate]);
+    } else {
+        $stmt = $conn->prepare("
+            SELECT COUNT(*)
+            FROM monthly_exam_attempts
+            WHERE user_id = ? AND exam_id = ?
+              AND created_at BETWEEN ? AND ?
+              AND status IN ('started','completed','abandoned','terminated')
+        ");
+        $stmt->execute([$userId, $examId, $startDate, $endDate]);
+    }
     return (int)$stmt->fetchColumn();
 }
 
-function getNextAttemptNumber(PDO $conn, int $userId, int $examId): int
+function getNextAttemptNumber(PDO $conn, int $userId, int $examId, ?int $attemptCourseId = null): int
 {
-    $stmt = $conn->prepare("SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM monthly_exam_attempts WHERE user_id = ? AND exam_id = ?");
-    $stmt->execute([$userId, $examId]);
+    if ($attemptCourseId !== null && $attemptCourseId > 0) {
+        $stmt = $conn->prepare("
+            SELECT COALESCE(MAX(attempt_number), 0) + 1
+            FROM monthly_exam_attempts
+            WHERE user_id = ? AND exam_id = ? AND course_id = ?
+        ");
+        $stmt->execute([$userId, $examId, $attemptCourseId]);
+    } else {
+        $stmt = $conn->prepare("SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM monthly_exam_attempts WHERE user_id = ? AND exam_id = ?");
+        $stmt->execute([$userId, $examId]);
+    }
     return (int)$stmt->fetchColumn();
 }
 
@@ -314,7 +374,6 @@ function evaluateExplanationAnswer(
 
 function gradeMonthlyExam(array $questions, array $answers): array
 {
-    global $conn;
     $correctCount = 0;
     $totalPoints = 0;
     $earnedPoints = 0;
@@ -445,11 +504,119 @@ function updateExamLeaderboardStats(PDO $conn, int $userId): void
     }
 }
 
+/* ============================================================
+ * PATCH 1: resolveMonthlyAttemptScope() helper
+ * Resolves which course enrollment the attempt belongs to.
+ * ============================================================ */
+function resolveMonthlyAttemptScope(PDO $conn, int $userId, array $exam): array
+{
+    $divisionId = isset($exam['division_id']) ? (int)$exam['division_id'] : 0;
+    $courseId   = isset($exam['course_id'])   ? (int)$exam['course_id']   : 0;
+
+    // 1. Try by division
+    if ($divisionId > 0) {
+        try {
+            $stmt = $conn->prepare("
+                SELECT e.id AS enrollment_id, e.course_id
+                FROM course_enrollments e
+                JOIN course_divisions cd ON cd.course_id = e.course_id
+                WHERE e.user_id = ?
+                  AND cd.id = ?
+                  AND e.status IN ('active','completed')
+                ORDER BY e.started_at DESC, e.id DESC
+                LIMIT 1
+            ");
+            $stmt->execute([$userId, $divisionId]);
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            if ($row) {
+                return [
+                    'course_id'     => (int)$row['course_id'],
+                    'enrollment_id' => (int)$row['enrollment_id'],
+                    'division_id'   => $divisionId,
+                ];
+            }
+        } catch (PDOException $e) {
+            error_log('monthly scope by division: ' . $e->getMessage());
+        }
+    }
+
+    // 2. Fall back to course_id
+    if ($courseId > 0) {
+        try {
+            $stmt = $conn->prepare("
+                SELECT id AS enrollment_id, course_id
+                FROM course_enrollments
+                WHERE user_id = ?
+                  AND course_id = ?
+                  AND status IN ('active','completed')
+                ORDER BY started_at DESC, id DESC
+                LIMIT 1
+            ");
+            $stmt->execute([$userId, $courseId]);
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            if ($row) {
+                return [
+                    'course_id'     => (int)$row['course_id'],
+                    'enrollment_id' => (int)$row['enrollment_id'],
+                    'division_id'   => $divisionId > 0 ? $divisionId : null,
+                ];
+            }
+        } catch (PDOException $e) {
+            error_log('monthly scope by course: ' . $e->getMessage());
+        }
+    }
+
+    return [
+        'course_id'     => $courseId > 0 ? $courseId : null,
+        'enrollment_id' => null,
+        'division_id'   => $divisionId > 0 ? $divisionId : null,
+    ];
+}
+
+/* ============================================================
+ * PATCH 6: ensureMonthlyExamAttemptsColumns() schema bootstrap
+ * Adds course_id + enrollment_id + indexes if missing.
+ * ============================================================ */
+function ensureMonthlyExamAttemptsColumns(PDO $conn): void
+{
+    try {
+        $cols = [];
+        $stmt = $conn->query("SHOW COLUMNS FROM `monthly_exam_attempts`");
+        foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+            $cols[strtolower((string)$row['Field'])] = true;
+        }
+
+        if (!isset($cols['course_id'])) {
+            $conn->exec("ALTER TABLE `monthly_exam_attempts` ADD COLUMN `course_id` INT UNSIGNED DEFAULT NULL AFTER `user_id`");
+        }
+        if (!isset($cols['enrollment_id'])) {
+            $conn->exec("ALTER TABLE `monthly_exam_attempts` ADD COLUMN `enrollment_id` INT UNSIGNED DEFAULT NULL AFTER `course_id`");
+        }
+
+        $idxStmt = $conn->query("SHOW INDEX FROM `monthly_exam_attempts`");
+        $idx = [];
+        foreach ($idxStmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+            $idx[$row['Key_name']] = true;
+        }
+        if (!isset($idx['idx_course'])) {
+            $conn->exec("ALTER TABLE `monthly_exam_attempts` ADD INDEX `idx_course` (`course_id`)");
+        }
+        if (!isset($idx['idx_enrollment'])) {
+            $conn->exec("ALTER TABLE `monthly_exam_attempts` ADD INDEX `idx_enrollment` (`enrollment_id`)");
+        }
+    } catch (PDOException $e) {
+        error_log('ensureMonthlyExamAttemptsColumns: ' . $e->getMessage());
+    }
+}
+
 $userId = requireUserAuthForExam();
 $conn = db();
 if (!$conn instanceof PDO) {
     exit('Database connection failed.');
 }
+
+// PATCH 6: run schema bootstrap once the connection is live
+ensureMonthlyExamAttemptsColumns($conn);
 
 $baseUrl = rtrim(dirname($_SERVER['SCRIPT_NAME']), '/');
 $baseUrl = str_replace('/admin', '', $baseUrl);
@@ -500,6 +667,10 @@ function readJsonBody(): array
     return is_array($decoded) ? $decoded : [];
 }
 
+/* ============================================================
+ * Resolve POST handler up front so we can scope by course.
+ * This runs before the GET-side page render below.
+ * ============================================================ */
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $postAction = $_POST['action'] ?? null;
     $jsonBody = [];
@@ -517,6 +688,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             echo json_encode(['success' => false, 'message' => 'Monthly exam not found']);
             exit;
         }
+
+        // PATCH 2: resolve scope for this attempt
+        $attemptScope       = resolveMonthlyAttemptScope($conn, $userId, $exam);
+        $attemptCourseId    = $attemptScope['course_id'];
+        $attemptEnrollmentId = $attemptScope['enrollment_id'];
+
         $now = new DateTime('now', new DateTimeZone('Africa/Dar_es_Salaam'));
         $startDt = new DateTime((string)$exam['start_date'], new DateTimeZone('Africa/Dar_es_Salaam'));
         $endDt   = new DateTime((string)$exam['end_date'], new DateTimeZone('Africa/Dar_es_Salaam'));
@@ -524,22 +701,43 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             echo json_encode(['success' => false, 'message' => 'This monthly exam is not active right now.']);
             exit;
         }
-        if (countAttemptsInWindow($conn, $examId, $userId, (string)$exam['start_date'], (string)$exam['end_date']) > 0) {
+
+        // PATCH 4: count attempts scoped by course
+        if (countAttemptsInWindow($conn, $examId, $userId, (string)$exam['start_date'], (string)$exam['end_date'], $attemptCourseId) > 0) {
             echo json_encode(['success' => false, 'message' => 'You have already attempted this monthly exam.']);
             exit;
         }
-        $conn->prepare("
-            UPDATE monthly_exam_attempts
-            SET status = 'abandoned', completed_at = NOW()
-            WHERE user_id = ? AND exam_id = ? AND status = 'started'
-        ")->execute([$userId, $examId]);
 
-        $attemptNumber = getNextAttemptNumber($conn, $userId, $examId);
+        // Abandon any stale started attempts for THIS course scope
+        if ($attemptCourseId !== null && $attemptCourseId > 0) {
+            $conn->prepare("
+                UPDATE monthly_exam_attempts
+                SET status = 'abandoned', completed_at = NOW()
+                WHERE user_id = ? AND exam_id = ? AND course_id = ? AND status = 'started'
+            ")->execute([$userId, $examId, $attemptCourseId]);
+        } else {
+            $conn->prepare("
+                UPDATE monthly_exam_attempts
+                SET status = 'abandoned', completed_at = NOW()
+                WHERE user_id = ? AND exam_id = ? AND status = 'started'
+            ")->execute([$userId, $examId]);
+        }
+
+        $attemptNumber = getNextAttemptNumber($conn, $userId, $examId, $attemptCourseId);
+
+        // PATCH 5: INSERT writes course_id and enrollment_id
         $stmt = $conn->prepare("
-            INSERT INTO monthly_exam_attempts (user_id, exam_id, attempt_number, status, started_at, created_at)
-            VALUES (?, ?, ?, 'started', NOW(), NOW())
+            INSERT INTO monthly_exam_attempts
+                (user_id, course_id, enrollment_id, exam_id, attempt_number, status, started_at, created_at)
+            VALUES (?, ?, ?, ?, ?, 'started', NOW(), NOW())
         ");
-        $stmt->execute([$userId, $examId, $attemptNumber]);
+        $stmt->execute([
+            $userId,
+            $attemptCourseId,
+            $attemptEnrollmentId,
+            $examId,
+            $attemptNumber,
+        ]);
         $attemptId = (int)$conn->lastInsertId();
         $attempt = getAttemptById($conn, $attemptId, $userId);
         $expiresAt = null;
@@ -588,13 +786,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             exit;
         }
 
+        // PATCH 2: resolve scope for this attempt
+        $attemptScope       = resolveMonthlyAttemptScope($conn, $userId, $exam);
+        $attemptCourseId    = $attemptScope['course_id'];
+        $attemptEnrollmentId = $attemptScope['enrollment_id'];
+
         $questions = getMonthlyExamQuestionsWithOptions($conn, $examId);
-        $existingCompletedAttempt = latestCompletedAttempt($conn, $examId, $userId);
+        // PATCH 3: scope the "already attempted" lookup by course
+        $existingCompletedAttempt = latestCompletedAttempt($conn, $examId, $userId, $attemptCourseId);
+
         $now = new DateTime('now', new DateTimeZone('Africa/Dar_es_Salaam'));
         $startDt = new DateTime((string)$exam['start_date'], new DateTimeZone('Africa/Dar_es_Salaam'));
         $endDt   = new DateTime((string)$exam['end_date'], new DateTimeZone('Africa/Dar_es_Salaam'));
 
-        if ($existingCompletedAttempt && countAttemptsInWindow($conn, $examId, $userId, (string)$exam['start_date'], (string)$exam['end_date']) > 0) {
+        if ($existingCompletedAttempt && countAttemptsInWindow($conn, $examId, $userId, (string)$exam['start_date'], (string)$exam['end_date'], $attemptCourseId) > 0) {
             echo json_encode([
                 'success' => false,
                 'attempted' => true,
@@ -612,7 +817,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $attempt = getAttemptById($conn, $attemptId, $userId);
         if (!$attempt || (int)$attempt['exam_id'] !== $examId || ($attempt['status'] ?? '') !== 'started') {
-            $attempt = getOpenAttempt($conn, $examId, $userId);
+            $attempt = getOpenAttempt($conn, $examId, $userId, $attemptCourseId);
         }
         if (!$attempt) {
             http_response_code(400);
@@ -624,13 +829,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $passed = $grade['percentage'] >= (float)($exam['passing_score'] ?? 70);
 
         try {
+            // PATCH 5b: include course_id / enrollment_id in UPDATE so resumed
+            // legacy rows get backfilled when the user finishes.
             $stmt = $conn->prepare("
                 UPDATE monthly_exam_attempts
-                SET total_questions = ?, correct_answers = ?, score = ?, total_points = ?, percentage = ?,
+                SET course_id = COALESCE(?, course_id),
+                    enrollment_id = COALESCE(?, enrollment_id),
+                    total_questions = ?, correct_answers = ?, score = ?, total_points = ?, percentage = ?,
                     passed = ?, status = 'completed', answers_json = ?, completed_at = NOW()
                 WHERE id = ? AND user_id = ? AND status = 'started'
             ");
             $stmt->execute([
+                $attemptCourseId,
+                $attemptEnrollmentId,
                 $grade['total_questions'],
                 $grade['correct_count'],
                 $grade['earned_points'],
@@ -642,11 +853,41 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $userId
             ]);
 
+            // ========== ACADEMY GRADE BOOK SYNC ==========
+            // Unchanged — academyRecordScheduled() does its own exam->course
+            // lookup from monthly_exams and uses the passed points.
+            if (!empty($exam['course_id']) && !empty($exam['division_id'])) {
+                try {
+                    require_once __DIR__ . '/includes/course_grades.php';
+
+                    if (function_exists('academyRecordScheduled')) {
+                        $sync = academyRecordScheduled(
+                            $conn,
+                            $userId,
+                            'exam',
+                            $examId,
+                            (float)$grade['earned_points'],   // raw points earned
+                            (float)$grade['total_points']     // raw points available
+                        );
+
+                        if ($sync === null) {
+                            error_log("Monthly exam sync: exam={$examId} returned null");
+                        } elseif (empty($sync['ok'])) {
+                            error_log("Monthly exam sync rejected: exam={$examId}, reason=" . ($sync['reason'] ?? 'unknown'));
+                        } else {
+                            error_log("Monthly exam sync OK: exam={$examId}, grade=" . ($sync['grade'] ?? 'null'));
+                        }
+                    } else {
+                        error_log("Monthly exam sync SKIPPED: academyRecordScheduled() not defined");
+                    }
+                } catch (Throwable $e) {
+                    error_log("Monthly exam sync FAILED: " . $e->getMessage());
+                }
+            }
+            // ========== /ACADEMY GRADE BOOK SYNC ==========
+
             updateExamLeaderboardStats($conn, $userId);
 
-            if (function_exists('notifyLeaderboardAchievement')) {
-                // optional existing app hook
-            }
             if (function_exists('notifyProgressMilestone')) {
                 try {
                     $completedStmt = $conn->prepare("SELECT COUNT(*) FROM monthly_exam_attempts WHERE user_id = ? AND status = 'completed'");
@@ -675,6 +916,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 }
 
+/* ============================================================
+ * GET-side page render
+ * ============================================================ */
+
 $examId = 0;
 foreach (['exam_id', 'quiz_id', 'id'] as $key) {
     if (isset($_GET[$key]) && is_numeric($_GET[$key])) {
@@ -687,6 +932,11 @@ $exam = getMonthlyExam($conn, $examId);
 if (!$exam) {
     exit('Monthly exam not found or not published.');
 }
+
+// PATCH 2: resolve scope right after the exam is loaded
+$attemptScope        = resolveMonthlyAttemptScope($conn, $userId, $exam);
+$attemptCourseId     = $attemptScope['course_id'];
+$attemptEnrollmentId = $attemptScope['enrollment_id'];
 
 $quizId = $examId;
 $quiz = [
@@ -770,11 +1020,13 @@ if ($competitionUpcoming) {
     exit;
 }
 
-$existingCompletedAttempt = latestCompletedAttempt($conn, $examId, $userId);
+// PATCH 3: scope the "already attempted" lookup
+$existingCompletedAttempt = latestCompletedAttempt($conn, $examId, $userId, $attemptCourseId);
 $attemptCount = 0;
 $maxAttempts = 1;
 $unlimited = false;
-$weeklyAttempts = countAttemptsInWindow($conn, $examId, $userId, $startDate, $endDate);
+// PATCH 4: scope the max-attempts count
+$weeklyAttempts = countAttemptsInWindow($conn, $examId, $userId, $startDate, $endDate, $attemptCourseId);
 $takeLocked = false;
 $lockReason = '';
 $attempt = null;
@@ -813,7 +1065,7 @@ if ($competitionEnded) {
     }
 
     if (!$takeLocked) {
-        $attempt = getOpenAttempt($conn, $examId, $userId);
+        $attempt = getOpenAttempt($conn, $examId, $userId, $attemptCourseId);
         if ($attempt && !empty($attempt['started_at'])) {
             $timeLimitMinutes = (int)($exam['time_limit_minutes'] ?? 0);
             if ($timeLimitMinutes > 0) {
@@ -838,7 +1090,6 @@ $endDateIso = $endDt->format('c');
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title><?php echo quizE((string)($quiz['title'] ?? 'Take Monthly Exam')); ?> - MyIslam</title>
     <style>
-        /* ===== Design tokens — matched to user_dashboard.php ===== */
         * { margin: 0; padding: 0; box-sizing: border-box; }
 
         :root {
@@ -970,7 +1221,6 @@ $endDateIso = $endDt->format('c');
         }
         .skip-link:focus { left: 0; }
 
-        /* ===== Header (matches dashboard) ===== */
         .app-header {
             position: sticky; top: 0; z-index: 1000;
             height: var(--header-height);
@@ -1064,7 +1314,6 @@ $endDateIso = $endDt->format('c');
             padding: 0 4px; border: 2px solid var(--surface);
         }
 
-        /* ===== Sidebar (matches dashboard) ===== */
         .sidebar-overlay {
             display: none; position: fixed; top: var(--header-height); left: 0;
             width: 100%; height: calc(100vh - var(--header-height));
@@ -1108,7 +1357,6 @@ $endDateIso = $endDt->format('c');
         }
         .sidebar-toggle-btn:hover { background: var(--brand-soft); color: var(--brand); }
 
-        /* ===== Main content wrapper ===== */
         .wrapper {
             max-width: 1000px;
             margin: 0 auto;
@@ -1116,7 +1364,6 @@ $endDateIso = $endDt->format('c');
             width: 100%;
         }
 
-        /* ===== Exam-specific cards (styled like section-card) ===== */
         .card, .quiz-section {
             background: var(--surface);
             border: 1px solid var(--line);
@@ -1360,7 +1607,6 @@ $endDateIso = $endDt->format('c');
         }
         .toast.show { transform: translateX(0); }
 
-        /* ===== Modal styles ===== */
         .modal-overlay {
             position: fixed;
             top: 0; left: 0; right: 0; bottom: 0;
@@ -1443,10 +1689,8 @@ $endDateIso = $endDt->format('c');
 <body>
 
 <?php if ($antiCheatEnabled): ?>
-<!-- Watermark overlay -->
 <div class="watermark-overlay" id="watermark"><?= quizE($userId) ?> - <?= date('Y-m-d') ?></div>
 
-<!-- Instructions Modal -->
 <div class="modal-overlay" id="instructionsModal" style="display: none;">
     <div class="modal">
         <h2>🏆 Competition Instructions</h2>
@@ -1466,7 +1710,6 @@ $endDateIso = $endDt->format('c');
     </div>
 </div>
 
-<!-- Warning Modal -->
 <div class="modal-overlay" id="warningModal" style="display: none;">
     <div class="modal">
         <h2 id="warningTitle">⚠️ Warning</h2>
@@ -1484,7 +1727,6 @@ $endDateIso = $endDt->format('c');
 </div>
 <?php endif; ?>
 
-<!-- Time‑Up Modal -->
 <div class="modal-overlay" id="timeUpModal" style="display: none;">
     <div class="modal" style="max-width: 450px;">
         <div style="font-size: 48px; margin-bottom: 16px;">⏰</div>
@@ -1504,7 +1746,6 @@ $endDateIso = $endDt->format('c');
 
 <a href="#mainContent" class="skip-link">Skip to main content</a>
 
-<!-- ===== HEADER (consistent with dashboard) ===== -->
 <header class="app-header">
     <div class="header-left">
         <a href="<?php echo quizE($baseUrl . 'user_dashboard.php'); ?>" class="brand-box" style="display:flex;align-items:center;gap:4px;">
@@ -1647,7 +1888,6 @@ $endDateIso = $endDt->format('c');
     </div>
 
     <?php if ($isCompetition && !$takeLocked && !$competitionEnded): ?>
-    <!-- Confirmation card -->
     <div class="confirmation-card" id="confirmationCard">
         <h3>🏁 Ready to Start Monthly Exam?</h3>
         <p>This is your one attempt for this monthly exam. Once you start, the timer will begin and you cannot pause.</p>
@@ -1771,7 +2011,6 @@ $endDateIso = $endDt->format('c');
 <div id="toast" class="toast"></div>
 
 <script>
-// Pass PHP data to JavaScript
 window.quizTakeData = {
     quizId: <?php echo (int)$quizId; ?>,
     attemptId: <?php echo (int)($attempt['id'] ?? 0); ?>,
@@ -1841,7 +2080,6 @@ window.quizTakeData = {
         }
     });
 
-    // Theme
     const savedTheme = localStorage.getItem('theme');
     if (savedTheme === 'dark' && body) {
         body.classList.add('dark-mode');
@@ -1856,7 +2094,6 @@ window.quizTakeData = {
         });
     }
 
-    // Language
     let currentLang = localStorage.getItem('language') || 'EN';
     if (langToggle) {
         langToggle.textContent = currentLang;
@@ -1867,7 +2104,6 @@ window.quizTakeData = {
         });
     }
 
-    // Profile dropdown
     if (profileToggle && profileMenu) {
         profileToggle.addEventListener('click', function(e) {
             e.stopPropagation();
@@ -1884,7 +2120,7 @@ window.quizTakeData = {
     }
 })();
 
-// ===== EXAM FUNCTIONALITY (Active exam + Result rendering) =====
+// ===== EXAM FUNCTIONALITY =====
 const toast = document.getElementById('toast');
 const submitQuizBtn = document.getElementById('submitQuizBtn');
 const quizForm = document.getElementById('quizForm');
@@ -2321,7 +2557,6 @@ function hideTimeUpModal() {
 async function handleTimeExpired() {
     if (submitInProgress || window.quizTakeData.locked) return;
 
-    // Show modal immediately
     if (timeUpModal) {
         const modalMessage = document.getElementById('timeUpMessage');
         const viewBtn = document.getElementById('viewResultBtn');
@@ -2341,7 +2576,6 @@ async function handleTimeExpired() {
         hideTimeUpModal();
         showToast('Exam submitted successfully.', false);
     } else {
-        // Auto‑submit failed – allow manual retry
         if (timeUpModal) {
             const modalMessage = document.getElementById('timeUpMessage');
             const viewBtn = document.getElementById('viewResultBtn');
@@ -2354,7 +2588,6 @@ async function handleTimeExpired() {
                 viewBtn.textContent = 'Retry Submission';
             }
         }
-        // Keep modal open so user can retry or exit
     }
 }
 
@@ -2398,7 +2631,6 @@ if (submitQuizBtn && quizForm && !window.quizTakeData.locked) {
     });
 }
 
-// Timer countdown
 if (window.quizTakeData.expiresAt && !window.quizTakeData.locked) {
     const endTime = new Date(String(window.quizTakeData.expiresAt).replace(' ', 'T')).getTime();
     const timerEl = document.getElementById('timer');
@@ -2420,7 +2652,6 @@ if (window.quizTakeData.expiresAt && !window.quizTakeData.locked) {
     timerInterval = setInterval(updateTimerDisplay, 1000);
 }
 
-// Competition confirmation flow
 if (confirmJoinBtn) {
     confirmJoinBtn.addEventListener('click', async () => {
         confirmJoinBtn.disabled = true;
@@ -2449,16 +2680,16 @@ if (confirmJoinBtn) {
             
             confirmationCard.style.display = 'none';
             instructionsModal.style.display = 'flex';
-       } catch (e) {
-    console.error('START EXAM ERROR:', e);
-    showToast('Could not start exam: ' + e.message, true);
-    confirmJoinBtn.disabled = false;
-    confirmJoinBtn.textContent = 'Yes, Start Monthly Exam';
-}
+            
+        } catch (e) {
+            console.error('START EXAM ERROR:', e);
+            showToast('Could not start exam: ' + e.message, true);
+            confirmJoinBtn.disabled = false;
+            confirmJoinBtn.textContent = 'Yes, Start Monthly Exam';
+        }
     });
 }
 
-// Anti-cheat setup
 if (startBtn) {
     startBtn.addEventListener('click', async () => {
         instructionsModal.style.display = 'none';

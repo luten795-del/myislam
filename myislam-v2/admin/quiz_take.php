@@ -21,6 +21,9 @@ if (!$conn instanceof PDO) {
     exit('Database connection failed.');
 }
 
+// Ensure quiz_attempts carries course_id / enrollment_id for per-course scoping.
+ensureQuizAttemptsColumns($conn);
+
 // Detect base URL for images (e.g., /myislam/)
 $baseUrl = rtrim(dirname($_SERVER['SCRIPT_NAME']), '/');
 $baseUrl = str_replace('/admin', '', $baseUrl);
@@ -176,17 +179,29 @@ function buildReviewFromAttempt(array $attempt, array $questions): array
     ];
 }
 
-function latestCompletedAttempt(PDO $conn, int $quizId, int $userId): ?array
+function latestCompletedAttempt(PDO $conn, int $quizId, int $userId, ?int $courseId = null): ?array
 {
     try {
-        $stmt = $conn->prepare("
-            SELECT *
-            FROM quiz_attempts
-            WHERE user_id = ? AND quiz_id = ? AND status IN ('completed', 'abandoned')
-            ORDER BY completed_at DESC, id DESC
-            LIMIT 1
-        ");
-        $stmt->execute([$userId, $quizId]);
+        if ($courseId !== null && $courseId > 0) {
+            $stmt = $conn->prepare("
+                SELECT *
+                FROM quiz_attempts
+                WHERE user_id = ? AND quiz_id = ? AND status IN ('completed', 'abandoned')
+                  AND (course_id = ? OR course_id IS NULL)
+                ORDER BY completed_at DESC, id DESC
+                LIMIT 1
+            ");
+            $stmt->execute([$userId, $quizId, $courseId]);
+        } else {
+            $stmt = $conn->prepare("
+                SELECT *
+                FROM quiz_attempts
+                WHERE user_id = ? AND quiz_id = ? AND status IN ('completed', 'abandoned')
+                ORDER BY completed_at DESC, id DESC
+                LIMIT 1
+            ");
+            $stmt->execute([$userId, $quizId]);
+        }
         $attempt = $stmt->fetch(PDO::FETCH_ASSOC);
         return $attempt ?: null;
     } catch (Throwable $e) {
@@ -195,35 +210,58 @@ function latestCompletedAttempt(PDO $conn, int $quizId, int $userId): ?array
     }
 }
 
-function competitionAttemptsUsed(PDO $conn, int $quizId, int $userId, array $quiz): int
+function competitionAttemptsUsed(PDO $conn, int $quizId, int $userId, array $quiz, ?int $courseId = null): int
 {
     $start = $quiz['competition_start_at'] ?? null;
     $end = $quiz['competition_end_at'] ?? null;
 
     try {
         if ($start && $end) {
-            $stmt = $conn->prepare("
-                SELECT COUNT(*)
-                FROM quiz_attempts
-                WHERE user_id = ?
-                  AND quiz_id = ?
-                  AND status IN ('completed', 'abandoned')
-                  AND completed_at BETWEEN ? AND ?
-            ");
-            $stmt->execute([$userId, $quizId, $start, $end]);
+            if ($courseId !== null && $courseId > 0) {
+                $stmt = $conn->prepare("
+                    SELECT COUNT(*)
+                    FROM quiz_attempts
+                    WHERE user_id = ?
+                      AND quiz_id = ?
+                      AND status IN ('completed', 'abandoned')
+                      AND completed_at BETWEEN ? AND ?
+                      AND (course_id = ? OR course_id IS NULL)
+                ");
+                $stmt->execute([$userId, $quizId, $start, $end, $courseId]);
+            } else {
+                $stmt = $conn->prepare("
+                    SELECT COUNT(*)
+                    FROM quiz_attempts
+                    WHERE user_id = ?
+                      AND quiz_id = ?
+                      AND status IN ('completed', 'abandoned')
+                      AND completed_at BETWEEN ? AND ?
+                ");
+                $stmt->execute([$userId, $quizId, $start, $end]);
+            }
             return (int)$stmt->fetchColumn();
         }
 
         if (function_exists('getCompetitionAttemptsInWindow')) {
-            return (int)getCompetitionAttemptsInWindow($conn, $quizId, $userId, $quiz);
+            return (int)getCompetitionAttemptsInWindow($conn, $quizId, $userId, $quiz, null, $courseId);
         }
 
-        $stmt = $conn->prepare("
-            SELECT COUNT(*)
-            FROM quiz_attempts
-            WHERE user_id = ? AND quiz_id = ? AND status IN ('completed', 'abandoned')
-        ");
-        $stmt->execute([$userId, $quizId]);
+        if ($courseId !== null && $courseId > 0) {
+            $stmt = $conn->prepare("
+                SELECT COUNT(*)
+                FROM quiz_attempts
+                WHERE user_id = ? AND quiz_id = ? AND status IN ('completed', 'abandoned')
+                  AND (course_id = ? OR course_id IS NULL)
+            ");
+            $stmt->execute([$userId, $quizId, $courseId]);
+        } else {
+            $stmt = $conn->prepare("
+                SELECT COUNT(*)
+                FROM quiz_attempts
+                WHERE user_id = ? AND quiz_id = ? AND status IN ('completed', 'abandoned')
+            ");
+            $stmt->execute([$userId, $quizId]);
+        }
         return (int)$stmt->fetchColumn();
     } catch (Throwable $e) {
         error_log('competitionAttemptsUsed error: ' . $e->getMessage());
@@ -305,16 +343,21 @@ if ($quizId <= 0) {
     exit('Invalid quiz ID.');
 }
 
+
 $quiz = getQuizForAttempt($conn, $quizId);
 if (!$quiz) {
     exit('Quiz not found or not published.');
 }
 
+// Resolve course scope for this user + quiz (used by every scoped attempt lookup).
+$attemptScope        = resolveQuizAttemptScope($conn, $quizId, $userId);
+$attemptCourseId     = $attemptScope['course_id'];
+$attemptEnrollmentId = $attemptScope['enrollment_id'];
+
 $quizMode = quizModeValue($quiz);
 $isCompetition = $quizMode === 'competition';
 $isSelf = $quizMode === 'self';
 $isLesson = $quizMode === 'lesson';
-
 // Determine competition status using local timezone
 // Determine competition status — delegate to the engine so page and engine
 // use the exact same window logic.
@@ -542,7 +585,7 @@ if ($isCompetition && $competitionUpcoming) {
 
 // For ended competitions, we show results directly using the same rendering logic as active flow
 if ($isCompetition && $competitionEnded) {
-    $existingCompletedAttempt = latestCompletedAttempt($conn, $quizId, $userId);
+$existingCompletedAttempt = latestCompletedAttempt($conn, $quizId, $userId, $attemptCourseId);
     $reviewPayload = null;
     $isParticipant = false;
 
@@ -585,7 +628,7 @@ if ($isCompetition && $competitionEnded) {
     // Continue to HTML output below
 } else {
     // ========== NORMAL QUIZ FLOW (ACTIVE COMPETITION OR NON-COMPETITION) ==========
-    $attemptCount = getAttemptCount($conn, $quizId, $userId); // counts completed attempts
+$attemptCount = getAttemptCount($conn, $quizId, $userId, $attemptCourseId); // counts completed attempts
     $maxAttempts = (int)($quiz['max_attempts'] ?? 3);
     $unlimited = (bool)($quiz['unlimited_attempts'] ?? false);
     $weeklyAttempts = 0;
@@ -594,20 +637,29 @@ if ($isCompetition && $competitionEnded) {
         // Count ANY attempt within the window (strict)
         $start = $quiz['competition_start_at'] ?? null;
         $end   = $quiz['competition_end_at'] ?? null;
-        if ($start && $end) {
-            $stmt = $conn->prepare("
-                SELECT COUNT(*) FROM quiz_attempts
-                WHERE user_id = ? AND quiz_id = ?
-                  AND created_at BETWEEN ? AND ?
-            ");
-            $stmt->execute([$userId, $quizId, $start, $end]);
-            $weeklyAttempts = (int)$stmt->fetchColumn();
-        } else {
-            $weeklyAttempts = competitionAttemptsUsed($conn, $quizId, $userId, $quiz);
-        }
+     if ($start && $end) {
+    if ($attemptCourseId !== null && $attemptCourseId > 0) {
+        $stmt = $conn->prepare("
+            SELECT COUNT(*) FROM quiz_attempts
+            WHERE user_id = ? AND quiz_id = ?
+              AND created_at BETWEEN ? AND ?
+              AND (course_id = ? OR course_id IS NULL)
+        ");
+        $stmt->execute([$userId, $quizId, $start, $end, $attemptCourseId]);
+    } else {
+        $stmt = $conn->prepare("
+            SELECT COUNT(*) FROM quiz_attempts
+            WHERE user_id = ? AND quiz_id = ?
+              AND created_at BETWEEN ? AND ?
+        ");
+        $stmt->execute([$userId, $quizId, $start, $end]);
     }
-
-    $existingCompletedAttempt = latestCompletedAttempt($conn, $quizId, $userId);
+    $weeklyAttempts = (int)$stmt->fetchColumn();
+} else {
+    $weeklyAttempts = competitionAttemptsUsed($conn, $quizId, $userId, $quiz, $attemptCourseId);
+}
+    }
+$existingCompletedAttempt = latestCompletedAttempt($conn, $quizId, $userId, $attemptCourseId);
 
     $takeLocked = false;
     $lockReason = '';
@@ -631,7 +683,7 @@ if ($isCompetition && $competitionEnded) {
     $attempt = null;
     $expiresAt = null;
     if (!$isCompetition && !$takeLocked) {
-        $attempt = getOpenAttempt($conn, $quizId, $userId);
+$attempt = getOpenAttempt($conn, $quizId, $userId, $attemptCourseId);
         if (!$attempt) {
             $attemptId = createQuizAttempt($conn, $quizId, $userId);
             if ((int)$attemptId > 0) {

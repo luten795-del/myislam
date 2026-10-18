@@ -35,18 +35,120 @@ function respond(array $data, int $status = 200): void
     exit;
 }
 
+/**
+ * Resolve which course enrollment this attempt belongs to.
+ *
+ * Priority:
+ *   1. If the quiz is scheduled in a course_division, find the user's
+ *      enrollment for that division's course.
+ *   2. Else, if the quiz itself has quizzes.course_id set, find the user's
+ *      active/completed enrollment in that course.
+ *   3. Else, no scope (NULL) — attempt is course-agnostic (e.g. content-scoped
+ *      legacy lesson quizzes).
+ *
+ * Returns ['course_id' => int|null, 'enrollment_id' => int|null, 'division_id' => int|null]
+ */
+function resolveQuizAttemptScope(PDO $conn, int $userId, int $quizId, array $quiz): array
+{
+    $courseId   = isset($quiz['course_id']) ? (int)$quiz['course_id'] : 0;
+    $divisionId = isset($quiz['division_id']) ? (int)$quiz['division_id'] : 0;
+
+    // If the quiz isn't linked directly, look at course_schedule to find the division
+    if ($divisionId <= 0) {
+        try {
+            $stmt = $conn->prepare("
+                SELECT division_id, course_id
+                FROM course_schedule
+                WHERE item_type = 'quiz' AND item_id = ?
+                ORDER BY id ASC
+                LIMIT 1
+            ");
+            $stmt->execute([$quizId]);
+            $schedRow = $stmt->fetch(PDO::FETCH_ASSOC);
+            if ($schedRow) {
+                $divisionId = (int)($schedRow['division_id'] ?? 0);
+                if ($courseId <= 0 && !empty($schedRow['course_id'])) {
+                    $courseId = (int)$schedRow['course_id'];
+                }
+            }
+        } catch (PDOException $e) {
+            quizLog("scope lookup: course_schedule error: " . $e->getMessage());
+        }
+    }
+
+    // If we have a division, resolve the enrollment through it
+    if ($divisionId > 0) {
+        try {
+            $stmt = $conn->prepare("
+                SELECT e.id AS enrollment_id, e.course_id
+                FROM course_enrollments e
+                JOIN course_divisions cd ON cd.course_id = e.course_id
+                WHERE e.user_id = ?
+                  AND cd.id = ?
+                  AND e.status IN ('active','completed')
+                ORDER BY e.started_at DESC, e.id DESC
+                LIMIT 1
+            ");
+            $stmt->execute([$userId, $divisionId]);
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            if ($row) {
+                return [
+                    'course_id'     => (int)$row['course_id'],
+                    'enrollment_id' => (int)$row['enrollment_id'],
+                    'division_id'   => $divisionId,
+                ];
+            }
+        } catch (PDOException $e) {
+            quizLog("scope lookup: enrollment (division) error: " . $e->getMessage());
+        }
+    }
+
+    // Fall back to course_id-only resolution
+    if ($courseId > 0) {
+        try {
+            $stmt = $conn->prepare("
+                SELECT id AS enrollment_id, course_id
+                FROM course_enrollments
+                WHERE user_id = ?
+                  AND course_id = ?
+                  AND status IN ('active','completed')
+                ORDER BY started_at DESC, id DESC
+                LIMIT 1
+            ");
+            $stmt->execute([$userId, $courseId]);
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            if ($row) {
+                return [
+                    'course_id'     => (int)$row['course_id'],
+                    'enrollment_id' => (int)$row['enrollment_id'],
+                    'division_id'   => $divisionId > 0 ? $divisionId : null,
+                ];
+            }
+        } catch (PDOException $e) {
+            quizLog("scope lookup: enrollment (course) error: " . $e->getMessage());
+        }
+    }
+
+    // Unscoped — content quiz or user not enrolled in a matching course
+    return [
+        'course_id'     => $courseId > 0 ? $courseId : null,
+        'enrollment_id' => null,
+        'division_id'   => $divisionId > 0 ? $divisionId : null,
+    ];
+}
+
 function ensureQuizAttemptsTable(PDO $conn): void
 {
-    // Check if table exists
     $stmt = $conn->query("SHOW TABLES LIKE 'quiz_attempts'");
     $tableExists = $stmt->rowCount() > 0;
 
     if (!$tableExists) {
-        // Create table with AUTO_INCREMENT
         $conn->exec("
             CREATE TABLE IF NOT EXISTS `quiz_attempts` (
                 `id` int NOT NULL AUTO_INCREMENT,
                 `user_id` int NOT NULL,
+                `course_id` int UNSIGNED DEFAULT NULL,
+                `enrollment_id` int UNSIGNED DEFAULT NULL,
                 `quiz_id` int NOT NULL,
                 `attempt_number` int NOT NULL DEFAULT '1',
                 `total_questions` int NOT NULL DEFAULT '0',
@@ -62,66 +164,56 @@ function ensureQuizAttemptsTable(PDO $conn): void
                 `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
                 `updated_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 PRIMARY KEY (`id`),
-                UNIQUE KEY `uq_quiz_attempt_user_quiz_attemptno` (`user_id`, `quiz_id`, `attempt_number`)
+                UNIQUE KEY `uq_quiz_attempt_user_quiz_attemptno` (`user_id`, `quiz_id`, `attempt_number`),
+                KEY `idx_course` (`course_id`),
+                KEY `idx_enrollment` (`enrollment_id`)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
         ");
-        quizLog("Created quiz_attempts table with AUTO_INCREMENT");
+        quizLog("Created quiz_attempts table with AUTO_INCREMENT + course_id/enrollment_id");
         return;
     }
 
-    // Table exists - check if id has AUTO_INCREMENT
+    // --- Fix AUTO_INCREMENT on id ---
     $stmt = $conn->query("SHOW COLUMNS FROM `quiz_attempts` WHERE Field = 'id'");
     $colInfo = $stmt->fetch(PDO::FETCH_ASSOC);
-    
+
     if ($colInfo && strpos($colInfo['Extra'] ?? '', 'auto_increment') === false) {
         try {
-            // Try simple modify first
             $conn->exec("ALTER TABLE `quiz_attempts` MODIFY `id` int NOT NULL AUTO_INCREMENT");
             quizLog("Fixed quiz_attempts.id to have AUTO_INCREMENT");
         } catch (PDOException $e) {
             quizLog("Simple modify failed: " . $e->getMessage());
-            // If simple modify fails, use multi-step approach
             try {
-                // Check if there are duplicate IDs
                 $stmt = $conn->query("SELECT id, COUNT(*) as cnt FROM quiz_attempts GROUP BY id HAVING COUNT(*) > 1");
                 $duplicates = $stmt->fetchAll(PDO::FETCH_ASSOC);
-                
+
                 if (!empty($duplicates)) {
                     quizLog("Found duplicate IDs, cleaning up...");
-                    // Create backup table
                     $conn->exec("CREATE TABLE IF NOT EXISTS quiz_attempts_backup LIKE quiz_attempts");
                     $conn->exec("INSERT INTO quiz_attempts_backup SELECT * FROM quiz_attempts");
-                    
-                    // Truncate the table to remove duplicates
                     $conn->exec("TRUNCATE TABLE quiz_attempts");
-                    
-                    // Re-insert data with new auto-generated IDs
                     $conn->exec("
                         INSERT INTO quiz_attempts (
-                            user_id, quiz_id, attempt_number, total_questions, 
-                            correct_answers, score, total_points, percentage, 
+                            user_id, course_id, enrollment_id, quiz_id, attempt_number,
+                            total_questions, correct_answers, score, total_points, percentage,
                             passed, status, started_at, completed_at, answers_json,
                             created_at, updated_at
                         )
-                        SELECT 
-                            user_id, quiz_id, attempt_number, total_questions, 
-                            correct_answers, score, total_points, percentage, 
+                        SELECT
+                            user_id, course_id, enrollment_id, quiz_id, attempt_number,
+                            total_questions, correct_answers, score, total_points, percentage,
                             passed, status, started_at, completed_at, answers_json,
                             created_at, updated_at
                         FROM quiz_attempts_backup
                     ");
-                    
-                    // Drop backup table
                     $conn->exec("DROP TABLE quiz_attempts_backup");
                     quizLog("Re-inserted data with new auto-generated IDs");
                 }
-                
-                // Now modify the id column
+
                 $conn->exec("ALTER TABLE `quiz_attempts` MODIFY `id` int NOT NULL AUTO_INCREMENT");
                 quizLog("Fixed quiz_attempts.id using multi-step approach");
             } catch (PDOException $e2) {
                 quizLog("Multi-step fix failed: " . $e2->getMessage());
-                // Last resort: try adding a new column and swapping
                 try {
                     $conn->exec("ALTER TABLE `quiz_attempts` ADD COLUMN temp_id INT AUTO_INCREMENT UNIQUE FIRST");
                     $conn->exec("ALTER TABLE `quiz_attempts` DROP PRIMARY KEY");
@@ -135,7 +227,7 @@ function ensureQuizAttemptsTable(PDO $conn): void
         }
     }
 
-    // Check and add missing columns
+    // --- Ensure all required columns exist ---
     $columns = [];
     $stmt = $conn->query("SHOW COLUMNS FROM `quiz_attempts`");
     foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $col) {
@@ -143,19 +235,21 @@ function ensureQuizAttemptsTable(PDO $conn): void
     }
 
     $required = [
-        'attempt_number'  => "ALTER TABLE `quiz_attempts` ADD COLUMN IF NOT EXISTS `attempt_number` int NOT NULL DEFAULT '1' AFTER `quiz_id`",
-        'total_questions' => "ALTER TABLE `quiz_attempts` ADD COLUMN IF NOT EXISTS `total_questions` int NOT NULL DEFAULT '0' AFTER `attempt_number`",
-        'correct_answers' => "ALTER TABLE `quiz_attempts` ADD COLUMN IF NOT EXISTS `correct_answers` int NOT NULL DEFAULT '0' AFTER `total_questions`",
-        'score'           => "ALTER TABLE `quiz_attempts` ADD COLUMN IF NOT EXISTS `score` int NOT NULL DEFAULT '0' AFTER `correct_answers`",
-        'total_points'    => "ALTER TABLE `quiz_attempts` ADD COLUMN IF NOT EXISTS `total_points` int NOT NULL DEFAULT '0' AFTER `score`",
-        'percentage'      => "ALTER TABLE `quiz_attempts` ADD COLUMN IF NOT EXISTS `percentage` decimal(5,2) NOT NULL DEFAULT '0.00' AFTER `total_points`",
-        'passed'          => "ALTER TABLE `quiz_attempts` ADD COLUMN IF NOT EXISTS `passed` tinyint(1) NOT NULL DEFAULT '0' AFTER `percentage`",
-        'status'          => "ALTER TABLE `quiz_attempts` ADD COLUMN IF NOT EXISTS `status` enum('started','completed','abandoned') NOT NULL DEFAULT 'started' AFTER `passed`",
-        'started_at'      => "ALTER TABLE `quiz_attempts` ADD COLUMN IF NOT EXISTS `started_at` datetime DEFAULT NULL AFTER `status`",
-        'completed_at'    => "ALTER TABLE `quiz_attempts` ADD COLUMN IF NOT EXISTS `completed_at` datetime DEFAULT NULL AFTER `started_at`",
-        'answers_json'    => "ALTER TABLE `quiz_attempts` ADD COLUMN IF NOT EXISTS `answers_json` longtext AFTER `completed_at`",
-        'created_at'      => "ALTER TABLE `quiz_attempts` ADD COLUMN IF NOT EXISTS `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP AFTER `answers_json`",
-        'updated_at'      => "ALTER TABLE `quiz_attempts` ADD COLUMN IF NOT EXISTS `updated_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP AFTER `created_at`",
+        'course_id'       => "ALTER TABLE `quiz_attempts` ADD COLUMN `course_id` INT UNSIGNED DEFAULT NULL AFTER `user_id`",
+        'enrollment_id'   => "ALTER TABLE `quiz_attempts` ADD COLUMN `enrollment_id` INT UNSIGNED DEFAULT NULL AFTER `course_id`",
+        'attempt_number'  => "ALTER TABLE `quiz_attempts` ADD COLUMN `attempt_number` int NOT NULL DEFAULT '1' AFTER `quiz_id`",
+        'total_questions' => "ALTER TABLE `quiz_attempts` ADD COLUMN `total_questions` int NOT NULL DEFAULT '0' AFTER `attempt_number`",
+        'correct_answers' => "ALTER TABLE `quiz_attempts` ADD COLUMN `correct_answers` int NOT NULL DEFAULT '0' AFTER `total_questions`",
+        'score'           => "ALTER TABLE `quiz_attempts` ADD COLUMN `score` int NOT NULL DEFAULT '0' AFTER `correct_answers`",
+        'total_points'    => "ALTER TABLE `quiz_attempts` ADD COLUMN `total_points` int NOT NULL DEFAULT '0' AFTER `score`",
+        'percentage'      => "ALTER TABLE `quiz_attempts` ADD COLUMN `percentage` decimal(5,2) NOT NULL DEFAULT '0.00' AFTER `total_points`",
+        'passed'          => "ALTER TABLE `quiz_attempts` ADD COLUMN `passed` tinyint(1) NOT NULL DEFAULT '0' AFTER `percentage`",
+        'status'          => "ALTER TABLE `quiz_attempts` ADD COLUMN `status` enum('started','completed','abandoned') NOT NULL DEFAULT 'started' AFTER `passed`",
+        'started_at'      => "ALTER TABLE `quiz_attempts` ADD COLUMN `started_at` datetime DEFAULT NULL AFTER `status`",
+        'completed_at'    => "ALTER TABLE `quiz_attempts` ADD COLUMN `completed_at` datetime DEFAULT NULL AFTER `started_at`",
+        'answers_json'    => "ALTER TABLE `quiz_attempts` ADD COLUMN `answers_json` longtext AFTER `completed_at`",
+        'created_at'      => "ALTER TABLE `quiz_attempts` ADD COLUMN `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP AFTER `answers_json`",
+        'updated_at'      => "ALTER TABLE `quiz_attempts` ADD COLUMN `updated_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP AFTER `created_at`",
     ];
 
     foreach ($required as $column => $sql) {
@@ -167,6 +261,25 @@ function ensureQuizAttemptsTable(PDO $conn): void
                 quizLog("Failed to add column {$column}: " . $e->getMessage());
             }
         }
+    }
+
+    // --- Ensure indexes exist ---
+    try {
+        $idxStmt = $conn->query("SHOW INDEX FROM `quiz_attempts`");
+        $indexes = [];
+        foreach ($idxStmt->fetchAll(PDO::FETCH_ASSOC) as $idx) {
+            $indexes[$idx['Key_name']] = true;
+        }
+        if (!isset($indexes['idx_course'])) {
+            $conn->exec("ALTER TABLE `quiz_attempts` ADD INDEX `idx_course` (`course_id`)");
+            quizLog("Added idx_course to quiz_attempts");
+        }
+        if (!isset($indexes['idx_enrollment'])) {
+            $conn->exec("ALTER TABLE `quiz_attempts` ADD INDEX `idx_enrollment` (`enrollment_id`)");
+            quizLog("Added idx_enrollment to quiz_attempts");
+        }
+    } catch (PDOException $e) {
+        quizLog("Index ensure error: " . $e->getMessage());
     }
 }
 
@@ -194,10 +307,19 @@ function buildAttemptPayload(array $attemptRow): array
     ];
 }
 
-function isCompetitionAttemptLocked(PDO $conn, int $userId, int $quizId, array $quiz): bool
+function isCompetitionAttemptLocked(PDO $conn, int $userId, int $quizId, array $quiz, ?int $courseId): bool
 {
     $start = $quiz['competition_start_at'] ?? null;
     $end = $quiz['competition_end_at'] ?? null;
+
+    // Build scope filter — if a course_id is known, only count attempts in
+    // that course. Otherwise fall back to unscoped (legacy behavior).
+    $scopeSql = '';
+    $scopeParams = [];
+    if ($courseId !== null && $courseId > 0) {
+        $scopeSql = " AND course_id = ? ";
+        $scopeParams[] = $courseId;
+    }
 
     if ($start && $end) {
         $stmt = $conn->prepare("
@@ -207,10 +329,11 @@ function isCompetitionAttemptLocked(PDO $conn, int $userId, int $quizId, array $
               AND quiz_id = ?
               AND status = 'completed'
               AND completed_at BETWEEN ? AND ?
+              $scopeSql
         ");
         $startUtc = (new DateTime($start, new DateTimeZone('UTC')))->format('Y-m-d H:i:s');
         $endUtc   = (new DateTime($end, new DateTimeZone('UTC')))->format('Y-m-d H:i:s');
-        $stmt->execute([$userId, $quizId, $startUtc, $endUtc]);
+        $stmt->execute(array_merge([$userId, $quizId, $startUtc, $endUtc], $scopeParams));
         return ((int)$stmt->fetchColumn()) >= 1;
     }
 
@@ -220,12 +343,11 @@ function isCompetitionAttemptLocked(PDO $conn, int $userId, int $quizId, array $
         WHERE user_id = ?
           AND quiz_id = ?
           AND status = 'completed'
+          $scopeSql
     ");
-    $stmt->execute([$userId, $quizId]);
+    $stmt->execute(array_merge([$userId, $quizId], $scopeParams));
     return ((int)$stmt->fetchColumn()) >= 1;
 }
-
-
 
 function updateQuizLeaderboardStats(PDO $conn, int $userId, string $mode): void
 {
@@ -233,33 +355,94 @@ function updateQuizLeaderboardStats(PDO $conn, int $userId, string $mode): void
         return;
     }
 
-    $stmt = $conn->prepare("
-        SELECT
-            COUNT(*) AS quizzes_taken,
-            SUM(CASE WHEN qa.status = 'completed' THEN 1 ELSE 0 END) AS quizzes_completed,
-            SUM(qa.score) AS total_points,
-            SUM(qa.correct_answers) AS total_correct,
-            SUM(qa.total_questions - qa.correct_answers) AS total_wrong,
-            AVG(qa.percentage) AS average_score,
-            MAX(qa.percentage) AS best_score,
-            SUM(TIMESTAMPDIFF(SECOND, qa.started_at, qa.completed_at)) AS total_time_seconds
-        FROM quiz_attempts qa
-        JOIN quizzes q ON q.id = qa.quiz_id
-        WHERE qa.user_id = ?
-          AND qa.status IN ('completed', 'abandoned')
-          AND q.mode = ?
-    ");
-    $stmt->execute([$userId, $mode]);
+    if ($mode === 'lesson') {
+        $stmt = $conn->prepare("
+            SELECT
+                COUNT(*) AS quizzes_taken,
+                SUM(CASE WHEN qa.status = 'completed' THEN 1 ELSE 0 END) AS quizzes_completed,
+                COALESCE(SUM(qa.score), 0) AS total_points,
+                COALESCE(SUM(qa.correct_answers), 0) AS total_correct,
+                COALESCE(SUM(qa.total_questions - qa.correct_answers), 0) AS total_wrong,
+                COALESCE(AVG(qa.percentage), 0) AS average_score,
+                COALESCE(MAX(qa.percentage), 0) AS best_score,
+                COALESCE(SUM(TIMESTAMPDIFF(SECOND, qa.started_at, qa.completed_at)), 0) AS total_time_seconds
+            FROM quiz_attempts qa
+            JOIN quizzes q ON q.id = qa.quiz_id
+            WHERE qa.user_id = ?
+              AND qa.status IN ('completed', 'abandoned')
+              AND q.mode IN ('lesson', 'self')
+              AND q.course_id IS NULL
+        ");
+        $stmt->execute([$userId]);
+    } else {
+        $stmt = $conn->prepare("
+            SELECT
+                SUM(t.quizzes_taken)      AS quizzes_taken,
+                SUM(t.quizzes_completed)  AS quizzes_completed,
+                SUM(t.total_points)       AS total_points,
+                SUM(t.total_correct)      AS total_correct,
+                SUM(t.total_wrong)        AS total_wrong,
+                CASE WHEN SUM(t.quizzes_taken) > 0
+                     THEN SUM(t.total_points) / SUM(t.quizzes_taken)
+                     ELSE 0 END           AS average_score,
+                MAX(t.best_score)         AS best_score,
+                SUM(t.total_time_seconds) AS total_time_seconds
+            FROM (
+                SELECT
+                    COUNT(*) AS quizzes_taken,
+                    SUM(CASE WHEN qa.status = 'completed' THEN 1 ELSE 0 END) AS quizzes_completed,
+                    COALESCE(SUM(qa.score), 0) AS total_points,
+                    COALESCE(SUM(qa.correct_answers), 0) AS total_correct,
+                    COALESCE(SUM(qa.total_questions - qa.correct_answers), 0) AS total_wrong,
+                    COALESCE(MAX(qa.percentage), 0) AS best_score,
+                    COALESCE(SUM(TIMESTAMPDIFF(SECOND, qa.started_at, qa.completed_at)), 0) AS total_time_seconds
+                FROM quiz_attempts qa
+                JOIN quizzes q ON q.id = qa.quiz_id
+                WHERE qa.user_id = ?
+                  AND qa.status IN ('completed', 'abandoned')
+                  AND q.mode = 'competition'
+                  AND q.course_id IS NOT NULL
+
+                UNION ALL
+
+                SELECT
+                    COUNT(*) AS quizzes_taken,
+                    SUM(CASE WHEN mea.status = 'completed' THEN 1 ELSE 0 END) AS quizzes_completed,
+                    COALESCE(SUM(mea.score), 0) AS total_points,
+                    COALESCE(SUM(mea.correct_answers), 0) AS total_correct,
+                    COALESCE(SUM(mea.total_questions - mea.correct_answers), 0) AS total_wrong,
+                    COALESCE(MAX(mea.percentage), 0) AS best_score,
+                    COALESCE(SUM(TIMESTAMPDIFF(SECOND, mea.started_at, mea.completed_at)), 0) AS total_time_seconds
+                FROM monthly_exam_attempts mea
+                JOIN monthly_exams me ON me.id = mea.exam_id
+                WHERE mea.user_id = ?
+                  AND mea.status IN ('completed', 'abandoned')
+                  AND me.course_id IS NOT NULL
+
+                UNION ALL
+
+                SELECT
+                    COUNT(*) AS quizzes_taken,
+                    SUM(CASE WHEN sea.status = 'completed' THEN 1 ELSE 0 END) AS quizzes_completed,
+                    COALESCE(SUM(sea.score), 0) AS total_points,
+                    COALESCE(SUM(sea.correct_answers), 0) AS total_correct,
+                    COALESCE(SUM(sea.total_questions - sea.correct_answers), 0) AS total_wrong,
+                    COALESCE(MAX(sea.percentage), 0) AS best_score,
+                    COALESCE(SUM(TIMESTAMPDIFF(SECOND, sea.started_at, sea.completed_at)), 0) AS total_time_seconds
+                FROM semester_exam_attempts sea
+                WHERE sea.user_id = ?
+                  AND sea.status IN ('completed', 'abandoned')
+            ) t
+        ");
+        $stmt->execute([$userId, $userId, $userId]);
+    }
+
     $stats = $stmt->fetch(PDO::FETCH_ASSOC);
 
-    if (!$stats || $stats['quizzes_taken'] == 0) {
+    if (!$stats || (int)($stats['quizzes_taken'] ?? 0) === 0) {
         return;
     }
 
-    // leaderboard_stats.id also has no AUTO_INCREMENT in the schema, so we
-    // supply it explicitly here too. Safe for the ON DUPLICATE KEY UPDATE
-    // path: MySQL only uses this id when actually inserting a new row —
-    // an existing row keeps its own id since id isn't in the UPDATE clause.
     $nextLbIdStmt = $conn->query("SELECT COALESCE(MAX(id), 0) + 1 FROM leaderboard_stats");
     $nextLbId = (int)$nextLbIdStmt->fetchColumn();
 
@@ -489,16 +672,15 @@ if (!in_array($quizMode, ['lesson', 'competition', 'self'], true)) {
     $quizMode = 'lesson';
 }
 
+// ---- Resolve attempt scope (course / enrollment) ----
+$scope = resolveQuizAttemptScope($conn, $userId, $quizId, $quiz);
+$attemptCourseId     = $scope['course_id'];
+$attemptEnrollmentId = $scope['enrollment_id'];
+
+quizLog("Attempt scope resolved: course_id=" . ($attemptCourseId ?? 'NULL') . ", enrollment_id=" . ($attemptEnrollmentId ?? 'NULL') . ", division_id=" . ($scope['division_id'] ?? 'NULL'));
+
 // -----------------------------------------------------------------------------
 // Admin access lock
-//
-// A single admin-controlled switch (quizzes.allow_access) that blocks
-// submission for ANY quiz mode - lesson, competition, or self - regardless
-// of publish status, competition window, or lesson-progression unlocks.
-// Checked first since it's meant as an unconditional override (e.g. a quiz
-// still being reviewed, or temporarily pulled without fully unpublishing
-// it). Defaults to allowed if the column isn't present yet (migration not
-// run), so behavior is unchanged until an admin explicitly locks a quiz.
 // -----------------------------------------------------------------------------
 if (array_key_exists('allow_access', $quiz) && (int)$quiz['allow_access'] === 0) {
     quizLog("Blocked quiz submission - access locked by admin for quiz {$quizId}");
@@ -508,18 +690,8 @@ if (array_key_exists('allow_access', $quiz) && (int)$quiz['allow_access'] === 0)
     ], 403);
 }
 
-
 // -----------------------------------------------------------------------------
 // Lesson-mode completion lock
-//
-// Lesson quizzes are tied to a content item via quizzes.content_id. If the
-// admin has disabled "Allow automatic completion" for that content (the
-// Completion Lock setting in admin_contents.php), block the submission
-// outright here — grading and saving an attempt is pointless when the
-// lesson it's meant to complete can never actually be marked complete
-// (ajax/complete_content.php enforces the same lock independently), and
-// without this check a user could still "use up" a limited attempt for
-// nothing.
 // -----------------------------------------------------------------------------
 if ($quizMode === 'lesson' && !empty($quiz['content_id'])) {
     $lockStmt = $conn->prepare("
@@ -531,8 +703,6 @@ if ($quizMode === 'lesson' && !empty($quiz['content_id'])) {
     $lockStmt->execute([(int)$quiz['content_id']]);
     $lockRow = $lockStmt->fetch(PDO::FETCH_ASSOC);
 
-    // Default to allowed if the row/column isn't present (e.g. migration not
-    // yet run), so behavior is unchanged until an admin explicitly locks it.
     $allowAutoCompletion = !$lockRow || !array_key_exists('allow_auto_completion', $lockRow) || (int)$lockRow['allow_auto_completion'] === 1;
 
     if (!$allowAutoCompletion) {
@@ -545,19 +715,35 @@ if ($quizMode === 'lesson' && !empty($quiz['content_id'])) {
 }
 
 // -----------------------------------------------------------------------------
-// Existing completed attempt rules
+// Existing completed attempt rules — scoped by course when possible
 // -----------------------------------------------------------------------------
-$stmt = $conn->prepare("
-    SELECT *
-    FROM quiz_attempts
-    WHERE user_id = ? AND quiz_id = ? AND status = 'completed'
-    ORDER BY completed_at DESC, id DESC
-    LIMIT 1
-");
-$stmt->execute([$userId, $quizId]);
-$existingAttempt = $stmt->fetch(PDO::FETCH_ASSOC);
+$existingAttempt = null;
+try {
+    if ($attemptCourseId !== null && $attemptCourseId > 0) {
+        $stmt = $conn->prepare("
+            SELECT *
+            FROM quiz_attempts
+            WHERE user_id = ? AND quiz_id = ? AND course_id = ? AND status = 'completed'
+            ORDER BY completed_at DESC, id DESC
+            LIMIT 1
+        ");
+        $stmt->execute([$userId, $quizId, $attemptCourseId]);
+    } else {
+        $stmt = $conn->prepare("
+            SELECT *
+            FROM quiz_attempts
+            WHERE user_id = ? AND quiz_id = ? AND status = 'completed'
+            ORDER BY completed_at DESC, id DESC
+            LIMIT 1
+        ");
+        $stmt->execute([$userId, $quizId]);
+    }
+    $existingAttempt = $stmt->fetch(PDO::FETCH_ASSOC) ?: null;
+} catch (PDOException $e) {
+    quizLog("Existing attempt lookup error: " . $e->getMessage());
+}
 
-if ($quizMode === 'competition' && isCompetitionAttemptLocked($conn, $userId, $quizId, $quiz)) {
+if ($quizMode === 'competition' && isCompetitionAttemptLocked($conn, $userId, $quizId, $quiz, $attemptCourseId)) {
     respond([
         'success' => false,
         'attempted' => true,
@@ -567,7 +753,7 @@ if ($quizMode === 'competition' && isCompetitionAttemptLocked($conn, $userId, $q
 }
 
 if ($existingAttempt && $quizMode === 'lesson') {
-    quizLog("User already completed this lesson quiz");
+    quizLog("User already completed this lesson quiz (course-scoped)");
     respond([
         'success' => false,
         'attempted' => true,
@@ -581,12 +767,21 @@ if ($existingAttempt && $quizMode === 'self') {
     $unlimited = (bool)($quiz['unlimited_attempts'] ?? false);
 
     if (!$unlimited && $maxAttempts > 0) {
-        $stmt = $conn->prepare("
-            SELECT COUNT(*)
-            FROM quiz_attempts
-            WHERE user_id = ? AND quiz_id = ? AND status = 'completed'
-        ");
-        $stmt->execute([$userId, $quizId]);
+        if ($attemptCourseId !== null && $attemptCourseId > 0) {
+            $stmt = $conn->prepare("
+                SELECT COUNT(*)
+                FROM quiz_attempts
+                WHERE user_id = ? AND quiz_id = ? AND course_id = ? AND status = 'completed'
+            ");
+            $stmt->execute([$userId, $quizId, $attemptCourseId]);
+        } else {
+            $stmt = $conn->prepare("
+                SELECT COUNT(*)
+                FROM quiz_attempts
+                WHERE user_id = ? AND quiz_id = ? AND status = 'completed'
+            ");
+            $stmt->execute([$userId, $quizId]);
+        }
         $completedAttempts = (int)$stmt->fetchColumn();
 
         if ($completedAttempts >= $maxAttempts) {
@@ -674,7 +869,7 @@ foreach ($questions as &$question) {
 unset($question);
 
 // -----------------------------------------------------------------------------
-// Validate answers (with auto‑submit awareness)
+// Validate answers
 // -----------------------------------------------------------------------------
 foreach ($questions as $question) {
     $qId = (int)$question['id'];
@@ -806,16 +1001,11 @@ if ($quizMode === 'lesson' && !$passed) {
 }
 
 // -----------------------------------------------------------------------------
-// Save attempt (only for passed lessons, or any outcome for other modes)
+// Save attempt
 // -----------------------------------------------------------------------------
 try {
     $conn->beginTransaction();
 
-    // attempt_number must increment for every mode, not just 'self' — the
-    // quiz_attempts table has UNIQUE KEY(user_id, quiz_id, attempt_number),
-    // and content.php's canTakeQuiz logic allows retakes for any mode when
-    // max_attempts > 1. Hardcoding 1 here caused a duplicate-key DB error
-    // the moment a user retook a lesson-mode quiz.
     $stmt = $conn->prepare("
         SELECT COALESCE(MAX(attempt_number), 0) + 1
         FROM quiz_attempts
@@ -840,6 +1030,8 @@ try {
             $stmt = $conn->prepare("
                 UPDATE quiz_attempts
                 SET
+                    course_id = COALESCE(?, course_id),
+                    enrollment_id = COALESCE(?, enrollment_id),
                     total_questions = ?,
                     correct_answers = ?,
                     score = ?,
@@ -852,6 +1044,8 @@ try {
                 WHERE id = ?
             ");
             $stmt->execute([
+                $attemptCourseId,
+                $attemptEnrollmentId,
                 $totalQuestions,
                 $correctCount,
                 $earnedPoints,
@@ -866,11 +1060,6 @@ try {
     }
 
     if ($savedAttemptId <= 0) {
-        // quiz_attempts.id has no AUTO_INCREMENT on this database (confirmed
-        // against the schema), and the DB user may not have ALTER privileges
-        // to fix that at runtime — so we compute the next id ourselves rather
-        // than relying on MySQL to generate one. FOR UPDATE keeps this safe
-        // under concurrent submissions within the open transaction.
         $nextIdStmt = $conn->query("SELECT COALESCE(MAX(id), 0) + 1 FROM quiz_attempts FOR UPDATE");
         $nextId = (int)$nextIdStmt->fetchColumn();
 
@@ -879,6 +1068,8 @@ try {
             (
                 id,
                 user_id,
+                course_id,
+                enrollment_id,
                 quiz_id,
                 attempt_number,
                 total_questions,
@@ -892,11 +1083,13 @@ try {
                 completed_at,
                 answers_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', NOW(), NOW(), ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', NOW(), NOW(), ?)
         ");
         $stmt->execute([
             $nextId,
             $userId,
+            $attemptCourseId,
+            $attemptEnrollmentId,
             $quizId,
             $attemptNumber,
             $totalQuestions,
@@ -911,7 +1104,38 @@ try {
     }
 
     $conn->commit();
-    quizLog("Attempt saved successfully. ID: {$savedAttemptId}, attempt_number: {$attemptNumber}");
+    quizLog("Attempt saved successfully. ID: {$savedAttemptId}, attempt_number: {$attemptNumber}, course_id=" . ($attemptCourseId ?? 'NULL') . ", enrollment_id=" . ($attemptEnrollmentId ?? 'NULL'));
+
+    // ========== ACADEMY GRADE BOOK SYNC ==========
+    if (!empty($quiz['course_id']) && !empty($quiz['division_id']) && !empty($quiz['subject_id'])) {
+        try {
+            require_once __DIR__ . '/../includes/course_grades.php';
+
+            if (function_exists('academyRecordScheduled')) {
+                $academyResult = academyRecordScheduled(
+                    $conn,
+                    $userId,
+                    'quiz',
+                    (int)$quizId,
+                    (float)$earnedPoints,
+                    (float)$totalPoints
+                );
+
+                if ($academyResult === null) {
+                    quizLog("Academy grade sync SKIPPED: quiz {$quizId} not linked to a course schedule.");
+                } elseif (empty($academyResult['ok'])) {
+                    quizLog("Academy grade sync REJECTED: " . ($academyResult['reason'] ?? 'unknown'));
+                } else {
+                    quizLog("Academy grade sync OK: " . json_encode($academyResult));
+                }
+            } else {
+                quizLog("Academy grade sync SKIPPED: academyRecordScheduled() not defined in ../includes/course_grades.php");
+            }
+        } catch (Throwable $e) {
+            quizLog("Academy grade sync FAILED: " . $e->getMessage());
+        }
+    }
+    // ========== /ACADEMY GRADE BOOK SYNC ==========
 
     // ========== Leaderboard & milestone notifications ==========
     $leaderboardMode = $quizMode === 'self' ? 'lesson' : $quizMode;

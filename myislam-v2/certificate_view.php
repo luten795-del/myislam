@@ -118,9 +118,20 @@ $completedAt = !empty($certificate['completed_at'])
     ? date('F d, Y', strtotime((string)$certificate['completed_at']))
     : '';
 
-$displayTrack = $certType === 'general'
-    ? 'General Certification - All Subjects'
-    : ($subjectName ? $subjectName . ' Subject Certification' : 'Subject Certification');
+switch ($certType) {
+    case 'general':
+        $displayTrack = 'General Certification - All Subjects';
+        break;
+    case 'course':
+        $displayTrack = 'Course Certificate - Full Course Completion';
+        break;
+    case 'division':
+        $displayTrack = 'Division Certificate - Semester Completed';
+        break;
+    case 'subject':
+    default:
+        $displayTrack = $subjectName ? $subjectName . ' Subject Certification' : 'Subject Certification';
+}
 
 $verifyUrl = '';
 if ($certificate) {
@@ -137,6 +148,11 @@ if ($certificate) {
     if ($certType === 'subject') {
         $subjectCategories = getSubjectCategories($conn, $subjectId, 18);
     } elseif ($certType === 'general') {
+        $generalCategoryGroups = getGeneralCategoryGroups($conn, 3, 8);
+    } elseif ($certType === 'division' || $certType === 'course') {
+        // Division and course certificates span multiple subjects.
+        // Reuse the general grouping (all subjects in the course/division)
+        // so the certificate page renders subject summaries.
         $generalCategoryGroups = getGeneralCategoryGroups($conn, 3, 8);
     }
 }

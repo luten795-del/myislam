@@ -64,9 +64,89 @@ function columnExists(PDO $conn, string $table, string $column): bool
     return $cache[$key];
 }
 
+/**
+ * Ensure quiz_attempts carries course_id and enrollment_id so attempt lookups
+ * can be scoped per course. Runs once per request; ALTERs only if needed.
+ */
+function ensureQuizAttemptsColumns(PDO $conn): void
+{
+    static $done = false;
+    if ($done) return;
+    $done = true;
+
+    if (!tableExists($conn, 'quiz_attempts')) {
+        return;
+    }
+
+    try {
+        if (!columnExists($conn, 'quiz_attempts', 'course_id')) {
+            $conn->exec("ALTER TABLE `quiz_attempts`
+                         ADD COLUMN `course_id` INT UNSIGNED DEFAULT NULL AFTER `user_id`,
+                         ADD INDEX `idx_quiz_attempts_course` (`course_id`)");
+            // bust the columnExists cache so later calls see the new column
+            $ref = new ReflectionFunction('columnExists');
+            // (columnExists uses a static cache; we can't reset it directly,
+            //  but the ADD COLUMN above only runs once thanks to $done).
+        }
+        if (!columnExists($conn, 'quiz_attempts', 'enrollment_id')) {
+            $conn->exec("ALTER TABLE `quiz_attempts`
+                         ADD COLUMN `enrollment_id` INT UNSIGNED DEFAULT NULL AFTER `course_id`,
+                         ADD INDEX `idx_quiz_attempts_enrollment` (`enrollment_id`)");
+        }
+    } catch (PDOException $e) {
+        error_log('ensureQuizAttemptsColumns: ' . $e->getMessage());
+    }
+}
+
+/**
+ * Resolve which (course_id, enrollment_id) this quiz attempt belongs to.
+ *
+ * Prefers quizzes.course_id when the quiz is course-scoped.
+ * Falls back to any active enrollment for the user when quizzes.course_id
+ * is NULL (legacy non-course quizzes) so legacy attempts still resolve a scope.
+ *
+ * Returns ['course_id' => ?int, 'enrollment_id' => ?int].
+ */
+function resolveQuizAttemptScope(PDO $conn, int $quizId, int $userId): array
+{
+    $courseId     = 0;
+    $enrollmentId = 0;
+
+    // 1. Ask the quiz what course it belongs to.
+    try {
+        if (columnExists($conn, 'quizzes', 'course_id')) {
+            $stmt = $conn->prepare("SELECT course_id FROM quizzes WHERE id = ? LIMIT 1");
+            $stmt->execute([$quizId]);
+            $courseId = (int)$stmt->fetchColumn();
+        }
+    } catch (PDOException $e) {
+        error_log('resolveQuizAttemptScope course lookup: ' . $e->getMessage());
+    }
+
+    // 2. Resolve enrollment for that course if we have one.
+    if ($courseId > 0) {
+        try {
+            $stmt = $conn->prepare("
+                SELECT id FROM course_enrollments
+                WHERE user_id = ? AND course_id = ? AND status IN ('active','completed')
+                ORDER BY started_at DESC, id DESC
+                LIMIT 1
+            ");
+            $stmt->execute([$userId, $courseId]);
+            $enrollmentId = (int)$stmt->fetchColumn();
+        } catch (PDOException $e) {
+            error_log('resolveQuizAttemptScope enrollment lookup: ' . $e->getMessage());
+        }
+    }
+
+    return [
+        'course_id'     => $courseId > 0 ? $courseId : null,
+        'enrollment_id' => $enrollmentId > 0 ? $enrollmentId : null,
+    ];
+}
+
 function pickOptionTable(PDO $conn): string
 {
-    // Force quiz_options for new schema
     return 'quiz_options';
 }
 
@@ -88,7 +168,6 @@ function getQuizMode(array $quiz): string
 
 function getCompetitionWindow(array $quiz): ?array
 {
-    // Single source of truth: everything is Africa/Dar_es_Salaam (EAT).
     $tz = new DateTimeZone('Africa/Dar_es_Salaam');
 
     if (!empty($quiz['competition_start_at']) && !empty($quiz['competition_end_at'])) {
@@ -134,8 +213,18 @@ function isCompetitionOpen(array $quiz): bool
     return $now >= $window['start'] && $now <= $window['end'];
 }
 
-function getCompetitionAttemptsInWindow(PDO $conn, int $quizId, int $userId, array $quiz, ?int $excludeAttemptId = null): int
-{
+/**
+ * Count attempts in the competition window.
+ * Scoped by course_id when provided, tolerant of legacy NULL rows.
+ */
+function getCompetitionAttemptsInWindow(
+    PDO $conn,
+    int $quizId,
+    int $userId,
+    array $quiz,
+    ?int $excludeAttemptId = null,
+    ?int $courseId = null
+): int {
     $window = getCompetitionWindow($quiz);
     if (!$window) {
         return 0;
@@ -150,7 +239,7 @@ function getCompetitionAttemptsInWindow(PDO $conn, int $quizId, int $userId, arr
     }
 
     try {
-                $sql = "
+        $sql = "
             SELECT COUNT(*)
             FROM quiz_attempts
             WHERE quiz_id = ?
@@ -165,6 +254,11 @@ function getCompetitionAttemptsInWindow(PDO $conn, int $quizId, int $userId, arr
             $window['start']->format('Y-m-d H:i:s'),
             $window['end']->format('Y-m-d H:i:s'),
         ];
+
+        if ($courseId !== null && $courseId > 0) {
+            $sql .= " AND (course_id = ? OR course_id IS NULL) ";
+            $params[] = $courseId;
+        }
 
         if ($excludeAttemptId !== null && $excludeAttemptId > 0) {
             $sql .= " AND id <> ? ";
@@ -196,6 +290,12 @@ function getQuizForAttempt(PDO $conn, int $quizId): ?array
         'q.status',
         's.name AS subject_name'
     ];
+
+    if (columnExists($conn, 'quizzes', 'course_id')) {
+        $select[] = 'q.course_id';
+    } else {
+        $select[] = 'NULL AS course_id';
+    }
 
     if (columnExists($conn, 'quizzes', 'max_attempts')) {
         $select[] = 'q.max_attempts';
@@ -308,18 +408,13 @@ function getQuizQuestionsWithOptions(PDO $conn, int $quizId): array
         ? 'sort_order'
         : '0 AS sort_order';
 
-    // Also fetch expected_answer and keywords_json for explanation questions
-    if (columnExists($conn, 'quiz_questions', 'expected_answer')) {
-        $questionSelect[] = 'expected_answer';
-    } else {
-        $questionSelect[] = 'NULL AS expected_answer';
-    }
+    $questionSelect[] = columnExists($conn, 'quiz_questions', 'expected_answer')
+        ? 'expected_answer'
+        : 'NULL AS expected_answer';
 
-    if (columnExists($conn, 'quiz_questions', 'keywords_json')) {
-        $questionSelect[] = 'keywords_json';
-    } else {
-        $questionSelect[] = 'NULL AS keywords_json';
-    }
+    $questionSelect[] = columnExists($conn, 'quiz_questions', 'keywords_json')
+        ? 'keywords_json'
+        : 'NULL AS keywords_json';
 
     $questionOrder = columnExists($conn, 'quiz_questions', 'sort_order')
         ? 'ORDER BY sort_order ASC, id ASC'
@@ -383,7 +478,6 @@ function getQuizQuestionsWithOptions(PDO $conn, int $quizId): array
         $options = $opt->fetchAll(PDO::FETCH_ASSOC) ?: [];
         $question['options'] = $options;
 
-        // Build option_map with integer keys for validation
         $optionMap = [];
         foreach ($options as $optRow) {
             $optionMap[(int)$optRow['id']] = $optRow;
@@ -395,36 +489,77 @@ function getQuizQuestionsWithOptions(PDO $conn, int $quizId): array
     return $questions;
 }
 
-function getAttemptCount(PDO $conn, int $quizId, int $userId): int
+/**
+ * Count completed attempts for a quiz.
+ * Scoped by course_id when provided, tolerant of legacy NULL rows.
+ */
+function getAttemptCount(PDO $conn, int $quizId, int $userId, ?int $courseId = null): int
 {
-    $stmt = $conn->prepare("
-        SELECT COUNT(*)
-        FROM quiz_attempts
-        WHERE quiz_id = ? AND user_id = ? AND status = 'completed'
-    ");
-    $stmt->execute([$quizId, $userId]);
+    if ($courseId !== null && $courseId > 0) {
+        $stmt = $conn->prepare("
+            SELECT COUNT(*)
+            FROM quiz_attempts
+            WHERE quiz_id = ? AND user_id = ? AND status = 'completed'
+              AND (course_id = ? OR course_id IS NULL)
+        ");
+        $stmt->execute([$quizId, $userId, $courseId]);
+    } else {
+        $stmt = $conn->prepare("
+            SELECT COUNT(*)
+            FROM quiz_attempts
+            WHERE quiz_id = ? AND user_id = ? AND status = 'completed'
+        ");
+        $stmt->execute([$quizId, $userId]);
+    }
     return (int)$stmt->fetchColumn();
 }
 
-function getOpenAttempt(PDO $conn, int $quizId, int $userId): ?array
+/**
+ * Most recent open attempt for a quiz.
+ * Scoped by course_id when provided, tolerant of legacy NULL rows.
+ */
+function getOpenAttempt(PDO $conn, int $quizId, int $userId, ?int $courseId = null): ?array
 {
-    $stmt = $conn->prepare("
-        SELECT *
-        FROM quiz_attempts
-        WHERE quiz_id = ? AND user_id = ? AND status = 'started'
-        ORDER BY id DESC
-        LIMIT 1
-    ");
-    $stmt->execute([$quizId, $userId]);
+    if ($courseId !== null && $courseId > 0) {
+        $stmt = $conn->prepare("
+            SELECT *
+            FROM quiz_attempts
+            WHERE quiz_id = ? AND user_id = ? AND status = 'started'
+              AND (course_id = ? OR course_id IS NULL)
+            ORDER BY id DESC
+            LIMIT 1
+        ");
+        $stmt->execute([$quizId, $userId, $courseId]);
+    } else {
+        $stmt = $conn->prepare("
+            SELECT *
+            FROM quiz_attempts
+            WHERE quiz_id = ? AND user_id = ? AND status = 'started'
+            ORDER BY id DESC
+            LIMIT 1
+        ");
+        $stmt->execute([$quizId, $userId]);
+    }
     return $stmt->fetch(PDO::FETCH_ASSOC) ?: null;
 }
 
+/**
+ * Create a new attempt row.
+ * Populates course_id / enrollment_id resolved from the quiz's course.
+ */
 function createQuizAttempt(PDO $conn, int $quizId, int $userId): int
 {
+    ensureQuizAttemptsColumns($conn);
+
     $quiz = getQuizForAttempt($conn, $quizId);
     if (!$quiz) {
         throw new RuntimeException('Quiz not found or not published.');
     }
+
+    // Resolve scope once for the whole function.
+    $scope        = resolveQuizAttemptScope($conn, $quizId, $userId);
+    $attemptCourseId     = $scope['course_id'];
+    $attemptEnrollmentId = $scope['enrollment_id'];
 
     $quizMode    = getQuizMode($quiz);
     $maxAttempts = (int)($quiz['max_attempts'] ?? 1);
@@ -442,55 +577,72 @@ function createQuizAttempt(PDO $conn, int $quizId, int $userId): int
             );
         }
 
-        $used = getCompetitionAttemptsInWindow($conn, $quizId, $userId, $quiz);
+        $used = getCompetitionAttemptsInWindow($conn, $quizId, $userId, $quiz, null, $attemptCourseId);
         if ($used >= 1) {
             throw new RuntimeException('You have already attempted this competition in this window.');
         }
     }
 
     if ($quizMode === 'lesson') {
-        $completedCount = getAttemptCount($conn, $quizId, $userId);
+        $completedCount = getAttemptCount($conn, $quizId, $userId, $attemptCourseId);
         if ($completedCount >= 1) {
             throw new RuntimeException('You have already completed this lesson quiz.');
         }
     }
 
     if ($quizMode === 'self' && !$unlimited && $maxAttempts > 0) {
-        $completedCount = getAttemptCount($conn, $quizId, $userId);
+        $completedCount = getAttemptCount($conn, $quizId, $userId, $attemptCourseId);
         if ($completedCount >= $maxAttempts) {
             throw new RuntimeException('You have reached the maximum attempts (' . $maxAttempts . ').');
         }
     }
 
-    $existing = getOpenAttempt($conn, $quizId, $userId);
+    $existing = getOpenAttempt($conn, $quizId, $userId, $attemptCourseId);
     if ($existing) {
         return (int)$existing['id'];
     }
 
     $attemptNumber = 1;
     if ($quizMode === 'self') {
-        $stmt = $conn->prepare("
-            SELECT COALESCE(MAX(attempt_number), 0) + 1
-            FROM quiz_attempts
-            WHERE user_id = ? AND quiz_id = ?
-        ");
-        $stmt->execute([$userId, $quizId]);
+        if ($attemptCourseId !== null && $attemptCourseId > 0) {
+            $stmt = $conn->prepare("
+                SELECT COALESCE(MAX(attempt_number), 0) + 1
+                FROM quiz_attempts
+                WHERE user_id = ? AND quiz_id = ? AND (course_id = ? OR course_id IS NULL)
+            ");
+            $stmt->execute([$userId, $quizId, $attemptCourseId]);
+        } else {
+            $stmt = $conn->prepare("
+                SELECT COALESCE(MAX(attempt_number), 0) + 1
+                FROM quiz_attempts
+                WHERE user_id = ? AND quiz_id = ?
+            ");
+            $stmt->execute([$userId, $quizId]);
+        }
         $attemptNumber = (int)$stmt->fetchColumn();
     }
 
     try {
         $stmt = $conn->prepare("
             INSERT INTO quiz_attempts
-            (user_id, quiz_id, attempt_number, total_points, status, started_at)
-            VALUES (?, ?, ?, ?, 'started', NOW())
+            (user_id, course_id, enrollment_id, quiz_id, attempt_number, total_points, status, started_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'started', NOW())
         ");
-        $stmt->execute([$userId, $quizId, $attemptNumber, $totalPoints]);
+        $stmt->execute([
+            $userId,
+            $attemptCourseId,
+            $attemptEnrollmentId,
+            $quizId,
+            $attemptNumber,
+            $totalPoints,
+        ]);
         return (int)$conn->lastInsertId();
     } catch (PDOException $e) {
         error_log("createQuizAttempt error: " . $e->getMessage());
         throw new RuntimeException('Failed to create attempt: ' . $e->getMessage());
     }
 }
+
 function getAttemptById(PDO $conn, int $attemptId, int $userId): ?array
 {
     $stmt = $conn->prepare("
@@ -553,31 +705,11 @@ function updateLeaderboardStats(
     if ($hasMode) {
         $sql = "
             INSERT INTO leaderboard_stats (
-                user_id,
-                mode,
-                total_points,
-                quizzes_taken,
-                quizzes_completed,
-                total_correct_answers,
-                total_wrong_answers,
-                average_score,
-                best_score,
-                total_time_seconds,
-                updated_at
+                user_id, mode, total_points, quizzes_taken, quizzes_completed,
+                total_correct_answers, total_wrong_answers, average_score, best_score,
+                total_time_seconds, updated_at
             )
-            VALUES (
-                ?,
-                ?,
-                ?,
-                1,
-                1,
-                ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                NOW()
-            )
+            VALUES (?, ?, ?, 1, 1, ?, ?, ?, ?, ?, NOW())
             ON DUPLICATE KEY UPDATE
                 total_points = total_points + VALUES(total_points),
                 quizzes_taken = quizzes_taken + 1,
@@ -592,41 +724,17 @@ function updateLeaderboardStats(
 
         $stmt = $conn->prepare($sql);
         $stmt->execute([
-            $userId,
-            $mode,
-            $score,
-            $correctAnswers,
-            $wrongAnswers,
-            $score,
-            $score,
-            $durationSeconds
+            $userId, $mode, $score, $correctAnswers, $wrongAnswers,
+            $score, $score, $durationSeconds
         ]);
     } else {
         $sql = "
             INSERT INTO leaderboard_stats (
-                user_id,
-                total_points,
-                quizzes_taken,
-                quizzes_completed,
-                total_correct_answers,
-                total_wrong_answers,
-                average_score,
-                best_score,
-                total_time_seconds,
-                updated_at
+                user_id, total_points, quizzes_taken, quizzes_completed,
+                total_correct_answers, total_wrong_answers, average_score, best_score,
+                total_time_seconds, updated_at
             )
-            VALUES (
-                ?,
-                ?,
-                1,
-                1,
-                ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                NOW()
-            )
+            VALUES (?, ?, 1, 1, ?, ?, ?, ?, ?, NOW())
             ON DUPLICATE KEY UPDATE
                 total_points = total_points + VALUES(total_points),
                 quizzes_taken = quizzes_taken + 1,
@@ -641,13 +749,8 @@ function updateLeaderboardStats(
 
         $stmt = $conn->prepare($sql);
         $stmt->execute([
-            $userId,
-            $score,
-            $correctAnswers,
-            $wrongAnswers,
-            $score,
-            $score,
-            $durationSeconds
+            $userId, $score, $correctAnswers, $wrongAnswers,
+            $score, $score, $durationSeconds
         ]);
     }
 }
@@ -713,38 +816,40 @@ function gradeAttempt(PDO $conn, int $attemptId, int $userId): ?array
 
         $quizMode = getQuizMode($quiz);
 
+        // Attempt's own course scope — used to scope the competition check.
+        $attemptCourseId = (int)($attempt['course_id'] ?? 0);
+
         $competitionAttempts = 0;
 
-if ($quizMode === 'competition') {
-    $window = getCompetitionWindow($quiz);
+        if ($quizMode === 'competition') {
+            $window = getCompetitionWindow($quiz);
 
-    if ($window) {
-        // Use the attempt's own start time — NOT "now".
-        // A legitimate attempt that started inside the window can always be submitted,
-        // even if the window has since closed.
-        $attemptStartRaw = $attempt['started_at'] ?? $attempt['created_at'] ?? null;
+            if ($window) {
+                $attemptStartRaw = $attempt['started_at'] ?? $attempt['created_at'] ?? null;
 
-        if ($attemptStartRaw === null) {
-            throw new RuntimeException('This attempt has no start timestamp and cannot be validated.');
-        }
+                if ($attemptStartRaw === null) {
+                    throw new RuntimeException('This attempt has no start timestamp and cannot be validated.');
+                }
 
-        $attemptStart = new DateTime((string)$attemptStartRaw, new DateTimeZone('Africa/Dar_es_Salaam'));
+                $attemptStart = new DateTime((string)$attemptStartRaw, new DateTimeZone('Africa/Dar_es_Salaam'));
 
-        if ($attemptStart < $window['start'] || $attemptStart > $window['end']) {
-            throw new RuntimeException(
-                'This attempt was started outside the competition window and cannot be submitted. ' .
-                'Attempt started: ' . $attemptStart->format('Y-m-d H:i') .
-                ' | Window: ' . $window['label']
+                if ($attemptStart < $window['start'] || $attemptStart > $window['end']) {
+                    throw new RuntimeException(
+                        'This attempt was started outside the competition window and cannot be submitted. ' .
+                        'Attempt started: ' . $attemptStart->format('Y-m-d H:i') .
+                        ' | Window: ' . $window['label']
+                    );
+                }
+            }
+
+            $competitionAttempts = getCompetitionAttemptsInWindow(
+                $conn, $quizId, $userId, $quiz, $attemptId,
+                $attemptCourseId > 0 ? $attemptCourseId : null
             );
+            if ($competitionAttempts >= 1) {
+                throw new RuntimeException('You have already submitted an attempt for this competition in this window.');
+            }
         }
-    }
-
-    // Count other completed attempts in the window (exclude this one).
-    $competitionAttempts = getCompetitionAttemptsInWindow($conn, $quizId, $userId, $quiz, $attemptId);
-    if ($competitionAttempts >= 1) {
-        throw new RuntimeException('You have already submitted an attempt for this competition in this window.');
-    }
-}
 
         $questions = getQuizQuestionsWithOptions($conn, $quizId);
         $optionTable = pickOptionTable($conn);
@@ -828,6 +933,8 @@ if ($quizMode === 'competition') {
             $updateParts[] = "submitted_at = NOW()";
         }
 
+        $durationSeconds = 0;
+
         if (columnExists($conn, 'quiz_attempts', 'duration_seconds') && !empty($attempt['started_at'])) {
             $startedAt = new DateTime((string)$attempt['started_at'], new DateTimeZone('Africa/Dar_es_Salaam'));
             $now = new DateTime('now', new DateTimeZone('Africa/Dar_es_Salaam'));
@@ -840,8 +947,6 @@ if ($quizMode === 'competition') {
             $durationSeconds = max(0, $now->getTimestamp() - $startedAt->getTimestamp());
             $updateParts[] = "time_spent_seconds = ?";
             $updateParams[] = $durationSeconds;
-        } else {
-            $durationSeconds = 0;
         }
 
         if (columnExists($conn, 'quiz_attempts', 'score')) {

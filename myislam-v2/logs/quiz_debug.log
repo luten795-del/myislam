@@ -160,3 +160,48 @@
 [2026-10-03 14:07:52] Q392 | submitted: 961 | available: 959,960,961,962
 [2026-10-03 14:07:52] Grading: 6/6 (100%) - Passed: Yes
 [2026-10-03 14:07:52] Attempt saved successfully. ID: 36, attempt_number: 2
+[2026-10-16 15:01:37] Submission started - User: 2, Quiz: 11, Mode: competition, Attempt: 6, Auto: Yes
+[2026-10-16 15:01:37] Q372 | submitted: 852 | available: 851,852,853,854
+[2026-10-16 15:01:37] Q373 | submitted: 856 | available: 855,856,857,858
+[2026-10-16 15:01:37] Q374 | submitted: 861 | available: 859,860,861,862
+[2026-10-16 15:01:37] Q375 | submitted: 866 | available: 863,864,865,866
+[2026-10-16 15:01:37] Q376 | submitted: 869 | available: 867,868,869,870
+[2026-10-16 15:01:37] Grading: 5/5 (100%) - Passed: Yes
+[2026-10-16 15:01:37] Attempt saved successfully. ID: 6, attempt_number: 2
+[2026-10-16 15:01:37] Academy grade sync FAILED: Failed opening required '/var/www/html/admin/includes/course_grades.php' (include_path='.:/usr/local/lib/php')
+[2026-10-16 15:07:35] Submission started - User: 12, Quiz: 11, Mode: competition, Attempt: 7, Auto: Yes
+[2026-10-16 15:07:35] Q372 | submitted: 852 | available: 851,852,853,854
+[2026-10-16 15:07:35] Q373 | submitted: 857 | available: 855,856,857,858
+[2026-10-16 15:07:35] Q374 | submitted: 862 | available: 859,860,861,862
+[2026-10-16 15:07:35] Q375 | submitted: 865 | available: 863,864,865,866
+[2026-10-16 15:07:35] Q376 | submitted: 867 | available: 867,868,869,870
+[2026-10-16 15:07:35] Grading: 1/5 (20%) - Passed: No
+[2026-10-16 15:07:35] Attempt saved successfully. ID: 7, attempt_number: 2
+[2026-10-16 15:07:35] Academy grade sync FAILED: Failed opening required '/var/www/html/admin/includes/course_grades.php' (include_path='.:/usr/local/lib/php')
+[2026-10-16 21:48:11] Submission started - User: 12, Quiz: 11, Mode: competition, Attempt: 1, Auto: Yes
+[2026-10-16 21:48:11] Q372 | submitted: 852 | available: 851,852,853,854
+[2026-10-16 21:48:11] Q373 | submitted: 856 | available: 855,856,857,858
+[2026-10-16 21:48:11] Q374 | submitted: 861 | available: 859,860,861,862
+[2026-10-16 21:48:11] Q375 | submitted: 866 | available: 863,864,865,866
+[2026-10-16 21:48:11] Q376 | submitted: 870 | available: 867,868,869,870
+[2026-10-16 21:48:11] Grading: 4/5 (80%) - Passed: Yes
+[2026-10-16 21:48:11] Attempt saved successfully. ID: 1, attempt_number: 2
+[2026-10-16 21:48:11] Academy grade sync OK: {"ok":true,"grade":null,"status":"in_progress","division_passed":false,"course_passed":false}
+[2026-10-18 05:43:47] Submission started - User: 2, Quiz: 11, Mode: competition, Attempt: 2, Auto: Yes
+[2026-10-18 05:43:47] Q372 | submitted: 852 | available: 851,852,853,854
+[2026-10-18 05:43:47] Q373 | submitted: 858 | available: 855,856,857,858
+[2026-10-18 05:43:47] Q374 | submitted: 859 | available: 859,860,861,862
+[2026-10-18 05:43:47] Q375 | submitted: 864 | available: 863,864,865,866
+[2026-10-18 05:43:47] Q376 | submitted: 867 | available: 867,868,869,870
+[2026-10-18 05:43:47] Grading: 1/5 (20%) - Passed: No
+[2026-10-18 05:43:47] Attempt saved successfully. ID: 2, attempt_number: 2
+[2026-10-18 05:43:47] Academy grade sync OK: {"ok":true,"grade":null,"status":"in_progress","division_passed":false,"course_passed":false}
+[2026-10-18 06:31:04] Submission started - User: 19, Quiz: 11, Mode: competition, Attempt: 3, Auto: Yes
+[2026-10-18 06:31:04] Q372 | submitted: 852 | available: 851,852,853,854
+[2026-10-18 06:31:04] Q373 | submitted: 856 | available: 855,856,857,858
+[2026-10-18 06:31:04] Q374 | submitted: 861 | available: 859,860,861,862
+[2026-10-18 06:31:04] Q375 | submitted: 866 | available: 863,864,865,866
+[2026-10-18 06:31:04] Q376 | submitted: 869 | available: 867,868,869,870
+[2026-10-18 06:31:04] Grading: 5/5 (100%) - Passed: Yes
+[2026-10-18 06:31:04] Attempt saved successfully. ID: 3, attempt_number: 2
+[2026-10-18 06:31:04] Academy grade sync OK: {"ok":true,"grade":null,"status":"in_progress","division_passed":false,"course_passed":false}

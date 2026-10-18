@@ -1,4 +1,3 @@
-
 services:
   web:
     build: .
@@ -25,7 +24,7 @@ services:
       MYSQL_USER: ${MYSQL_USER:-myislam_user}
       MYSQL_PASSWORD: ${MYSQL_PASSWORD}
     ports:
-      - "${DB_PORT:-3306}:3306"
+      - "${DB_PORT:-8083}:3306"
     volumes:
       - myislam_db_data:/var/lib/mysql
       - ./myislam.sql:/docker-entrypoint-initdb.d/myislam.sql:ro

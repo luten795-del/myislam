@@ -425,7 +425,8 @@ function getPartSections(PDO $conn, int $partId): array {
             SELECT id, part_id, section_number, 
                    content, content_html,
                    language, direction, sort_order,
-                   text_color, background_color
+                   text_color, background_color,
+                   video_path, video_url, video_caption, display_separate
             FROM part_sections
             WHERE part_id = ?
             ORDER BY sort_order ASC, section_number ASC
@@ -639,8 +640,8 @@ function savePartSections(PDO $conn, int $partId, array $sections): void {
         }
         
         $stmt = $conn->prepare("
-            INSERT INTO part_sections (part_id, section_number, content, content_html, language, direction, sort_order, text_color, background_color)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO part_sections (part_id, section_number, content, content_html, language, direction, sort_order, text_color, background_color, video_path, video_url, video_caption, display_separate)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ");
         
         foreach ($sections as $section) {
@@ -653,8 +654,12 @@ function savePartSections(PDO $conn, int $partId, array $sections): void {
             $textColor = $section['text_color'] ?? null;
             $bgColor = $section['background_color'] ?? null;
             
-            // Only save if there's content
-            if (empty($content) && empty($contentHtml)) {
+            $videoPath    = trim((string)($section['video_path'] ?? ''));
+            $videoUrl     = trim((string)($section['video_url'] ?? ''));
+            $videoCaption = trim((string)($section['video_caption'] ?? ''));
+            
+            // Keep the section if it has text OR a video
+            if (empty($content) && empty($contentHtml) && $videoPath === '' && $videoUrl === '') {
                 continue;
             }
             
@@ -667,7 +672,11 @@ function savePartSections(PDO $conn, int $partId, array $sections): void {
                 $direction,
                 $sortOrder,
                 $textColor,
-                $bgColor
+                $bgColor,
+                $videoPath !== ''    ? $videoPath    : null,
+                $videoUrl !== ''     ? $videoUrl     : null,
+                $videoCaption !== '' ? $videoCaption : null,
+                !empty($section['display_separate']) ? 1 : 0
             ]);
         }
     } catch (PDOException $e) {
@@ -1115,7 +1124,37 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         $sectionContent = trim($sectionData['content'] ?? '');
                         $sectionHtml = trim($sectionData['content_html'] ?? '');
                         
-                        if (empty($sectionContent) && empty($sectionHtml)) {
+                        // ---- Section video: uploaded file (keeps the old one if no new upload) ----
+                        $secVideoPath = trim((string)($sectionData['existing_video_path'] ?? ''));
+                        $secVideoPath = $secVideoPath !== '' ? $secVideoPath : null;
+
+                        if (isset($_FILES['parts']['name'][$idx]['sections'][$secIdx]['video_file']) &&
+                            $_FILES['parts']['error'][$idx]['sections'][$secIdx]['video_file'] === UPLOAD_ERR_OK &&
+                            $_FILES['parts']['size'][$idx]['sections'][$secIdx]['video_file'] > 0) {
+                            $file = [
+                                'name'     => $_FILES['parts']['name'][$idx]['sections'][$secIdx]['video_file'],
+                                'type'     => $_FILES['parts']['type'][$idx]['sections'][$secIdx]['video_file'],
+                                'tmp_name' => $_FILES['parts']['tmp_name'][$idx]['sections'][$secIdx]['video_file'],
+                                'error'    => $_FILES['parts']['error'][$idx]['sections'][$secIdx]['video_file'],
+                                'size'     => $_FILES['parts']['size'][$idx]['sections'][$secIdx]['video_file'],
+                            ];
+                            $uploadedPath = handleFileUpload($file, 'video');
+                            if ($uploadedPath !== null) {
+                                $secVideoPath = $uploadedPath;
+                            }
+                        }
+
+                        // ---- Section video: YouTube / Vimeo link or pasted <iframe> code ----
+                        $secVideoUrl = normalizeVideoEmbedUrl($sectionData['video_url'] ?? '');
+                        if ($secVideoUrl !== '' && !preg_match('#^https://#i', $secVideoUrl)) {
+                            $secVideoUrl = ''; // only allow https embeds
+                        }
+                        $secVideoCaption = trim((string)($sectionData['video_caption'] ?? ''));
+                        // Per-section "keep separate" flag (only matters when the part uses Combined Paragraph mode)
+                        $secSeparate = !empty($sectionData['display_separate']) ? 1 : 0;
+
+                        // Skip only if the section has no text AND no video
+                        if (empty($sectionContent) && empty($sectionHtml) && $secVideoPath === null && $secVideoUrl === '') {
                             continue;
                         }
                         
@@ -1147,7 +1186,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             'direction' => $sectionData['direction'] ?? 'ltr',
                             'sort_order' => (int)($sectionData['sort_order'] ?? count($sections) + 1),
                             'text_color' => $textColor,
-                            'background_color' => $bgColor
+                            'background_color' => $bgColor,
+                            'video_path' => $secVideoPath,
+                            'video_url' => $secVideoUrl !== '' ? $secVideoUrl : null,
+                            'video_caption' => $secVideoCaption !== '' ? $secVideoCaption : null,
+                            'display_separate' => $secSeparate
                         ];
                     }
                 }
@@ -2688,6 +2731,11 @@ function buildSectionHtml(partIndex, idx, sectionNumber, opts = {}) {
     const bgTouched = opts.bgTouched ? '1' : '0';
     const content = opts.content || '';
     const contentHtml = opts.contentHtml || '';
+    const videoPath = opts.videoPath || '';
+    const videoUrl = opts.videoUrl || '';
+    const videoCaption = opts.videoCaption || '';
+    const keepSeparate = !!opts.separate;
+    const vBase = `parts[${partIndex}][sections][${idx}]`;
 
     return `
         <div class="section-item" data-section-number="${sectionNumber}">
@@ -2724,10 +2772,32 @@ function buildSectionHtml(partIndex, idx, sectionNumber, opts = {}) {
                 </div>
             </div>
             
+            <!-- Keep this section separate even when the part is in Combined Paragraph mode -->
+            <label class="section-separate-toggle" style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:13px;font-weight:600;cursor:pointer;">
+                <input type="checkbox" name="${vBase}[display_separate]" value="1" ${keepSeparate ? 'checked' : ''}>
+                <span>📌 Show this section separately <span style="font-weight:400;color:var(--muted);">(stays its own block even when the part is in Combined Paragraph mode)</span></span>
+            </label>
+
             <div class="section-editor-wrapper">
                 <div class="part-editor" id="section_editor_${partIndex}_${idx}" style="min-height:150px;"></div>
                 <textarea name="parts[${partIndex}][sections][${idx}][content]" style="display:none;">${escapeHtml(content)}</textarea>
                 <textarea name="parts[${partIndex}][sections][${idx}][content_html]" id="section_html_${partIndex}_${idx}" style="display:none;">${escapeHtml(contentHtml)}</textarea>
+            </div>
+
+            <!-- Section Video (optional): uploaded file and/or YouTube/Vimeo link -->
+            <div class="section-video-box" style="margin-top:12px;padding:12px;border:1px dashed var(--line);border-radius:10px;">
+                <label style="font-size:13px;font-weight:700;">🎬 Section Video (optional)</label>
+                <input type="file" name="${vBase}[video_file]" accept="video/*" class="form-input" style="margin-top:6px;">
+                <input type="hidden" name="${vBase}[existing_video_path]" value="${escapeHtml(videoPath)}">
+                ${videoPath ? `
+                <div class="section-video-current" style="margin:6px 0;display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+                    <span style="font-size:12px;color:var(--muted);">📁 Current: ${escapeHtml(videoPath.split('/').pop())}</span>
+                    <button type="button" class="btn danger btn-sm" onclick="removeSectionVideoFile(this)">🗑️ Remove file</button>
+                </div>` : ''}
+                <input type="text" name="${vBase}[video_url]" class="form-input" style="margin-top:6px;"
+                       placeholder="Or paste a YouTube / Vimeo link (or embed code)" value="${escapeHtml(videoUrl)}">
+                <input type="text" name="${vBase}[video_caption]" class="form-input" style="margin-top:6px;"
+                       placeholder="Video caption (optional)" value="${escapeHtml(videoCaption)}">
             </div>
         </div>
     `;
@@ -2872,6 +2942,17 @@ function updateSectionDirection(select, partIndex, sectionIndex) {
             setEditorToLTR(editorDiv.editorInstance);
         }
     }
+}
+
+// Clears the saved video file of a section. Applied when "Save Content" is clicked.
+function removeSectionVideoFile(btn) {
+    const box = btn.closest('.section-video-box');
+    if (!box) return;
+    const hidden = box.querySelector('input[name$="[existing_video_path]"]');
+    if (hidden) hidden.value = '';
+    const current = box.querySelector('.section-video-current');
+    if (current) current.remove();
+    showToast('Video file removed. Click "Save Content" to apply.', 'success');
 }
 
 function removeSection(btn) {
@@ -3037,7 +3118,11 @@ async function addPartWithData(part, index) {
                 textColor: section.text_color || '#1f2937',
                 bgColor: section.background_color || '#ffffff',
                 textTouched: !!section.text_color && !untouchedPair,
-                bgTouched: !!section.background_color && !untouchedPair
+                bgTouched: !!section.background_color && !untouchedPair,
+                videoPath: section.video_path || '',
+                videoUrl: section.video_url || '',
+                videoCaption: section.video_caption || '',
+                separate: String(section.display_separate) === '1'
             });
             seq = secIdx + 1;
         });

@@ -251,6 +251,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $title = trim((string)($_POST['title'] ?? ''));
         $slugInput = trim((string)($_POST['slug'] ?? ''));
         $description = trim((string)($_POST['description'] ?? ''));
+        $courseId    = isset($_POST['course_id'])    && $_POST['course_id']    !== '' ? (int)$_POST['course_id']    : null;
+$divisionId  = isset($_POST['division_id'])  && $_POST['division_id']  !== '' ? (int)$_POST['division_id']  : null;
+$weekNumber  = isset($_POST['week_number'])  && $_POST['week_number']  !== '' ? (int)$_POST['week_number']  : null;
+
+// Validate: if course_id is set but division_id isn't, clear both
+// (an exam with a course but no division is meaningless for grading)
+if ($courseId !== null && $divisionId === null) {
+    $courseId = null;
+}
+// If division is set but course isn't, clear division too
+if ($divisionId !== null && $courseId === null) {
+    $divisionId = null;
+}
         $subjectId = isset($_POST['subject_id']) && $_POST['subject_id'] !== '' ? (int)$_POST['subject_id'] : null;
         $monthYear = trim((string)($_POST['month_year'] ?? ''));
         $startDate = trim((string)($_POST['start_date'] ?? ''));
@@ -296,10 +309,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         UPDATE monthly_exams
                         SET title = ?, slug = ?, description = ?, subject_id = ?, month_year = ?,
                             start_date = ?, end_date = ?, time_limit_minutes = ?, passing_score = ?,
-                            max_attempts = ?, status = ?, allow_access = ?
+                            max_attempts = ?, status = ?, allow_access = ?,
+                            course_id = ?, division_id = ?, week_number = ?
                         WHERE id = ?
                     ");
-                    $stmt->execute([$title, $slug, $description, $subjectId, $monthYear, $startDb, $endDb, $timeLimit, $passingScore, $maxAttempts, $status, $allowAccess, $examId]);
+                    $stmt->execute([
+                        $title, $slug, $description, $subjectId, $monthYear,
+                        $startDb, $endDb, $timeLimit, $passingScore,
+                        $maxAttempts, $status, $allowAccess,
+                        $courseId, $divisionId, $weekNumber,
+                        $examId
+                    ]);
                     
                     // ========== ADDED: Notify users if exam is published (newly or updated to published) ==========
                     if ($status === 'published' && !$wasPublished) {
@@ -314,10 +334,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 } else {
                     $stmt = $conn->prepare("
                         INSERT INTO monthly_exams
-                        (title, slug, description, subject_id, month_year, start_date, end_date, time_limit_minutes, passing_score, max_attempts, status, allow_access, created_by)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (title, slug, description, subject_id, month_year, start_date, end_date, time_limit_minutes, passing_score, max_attempts, status, allow_access, created_by, course_id, division_id, week_number)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ");
-                    $stmt->execute([$title, $slug, $description, $subjectId, $monthYear, $startDb, $endDb, $timeLimit, $passingScore, $maxAttempts, $status, $allowAccess, $userId]);
+                    $stmt->execute([
+                        $title, $slug, $description, $subjectId, $monthYear,
+                        $startDb, $endDb, $timeLimit, $passingScore,
+                        $maxAttempts, $status, $allowAccess, $userId,
+                        $courseId, $divisionId, $weekNumber
+                    ]);
                     $newExamId = (int)$conn->lastInsertId();
                     
                     // ========== ADDED: Notify users if new exam is published ==========
@@ -460,6 +485,35 @@ $totalExams = count($exams);
 $publishedExams = count(array_filter($exams, fn($e) => $e['status'] === 'published'));
 $activeExams = count(array_filter($exams, fn($e) => strtotime($e['end_date']) >= time() && strtotime($e['start_date']) <= time()));
 $draftExams = count(array_filter($exams, fn($e) => $e['status'] === 'draft'));
+// ========== NEW: Load courses + their divisions for the academy link ==========
+$allCoursesList = [];
+try {
+    $stmt = $conn->query("
+        SELECT c.id, c.title
+        FROM courses c
+        WHERE c.status IN ('published','draft')
+        ORDER BY c.created_at DESC, c.id DESC
+    ");
+    $courses = $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
+
+    if ($courses) {
+        $divStmt = $conn->prepare("
+            SELECT id, number, name
+            FROM course_divisions
+            WHERE course_id = ?
+            ORDER BY number ASC, id ASC
+        ");
+        foreach ($courses as &$cRow) {
+            $divStmt->execute([(int)$cRow['id']]);
+            $cRow['divisions'] = $divStmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
+        }
+        unset($cRow);
+    }
+    $allCoursesList = $courses;
+} catch (PDOException $e) {
+    error_log('load courses for monthly exam form: ' . $e->getMessage());
+}
+// ========== /NEW ==========
 
 $mainNavigation = [
     ['name' => 'Dashboard', 'link' => 'dashboard.php', 'active' => false],
@@ -723,6 +777,28 @@ a{text-decoration:none;color:inherit} button,input,textarea,select{font:inherit}
                 <div class="form-row"><label>Slug</label><input type="text" name="slug" id="slug" class="form-input" placeholder="auto-generated"></div>
                 <div class="form-row"><label>Description</label><textarea name="description" id="description" class="form-textarea"></textarea></div>
                 <div class="form-row"><label>Subject</label><select name="subject_id" id="subject_id" class="form-select"><option value="">All Subjects (Optional)</option><?php foreach($subjects as $s): ?><option value="<?php echo $s['id']; ?>"><?php echo e($s['name']); ?></option><?php endforeach; ?></select></div>
+                    <!-- ========== NEW: Academy link (optional) ========== -->
+<div class="form-row"><label>Course <small style="font-weight:400;color:var(--muted);">(optional — set to make it an academy monthly exam)</small></label>
+    <select name="course_id" id="exam_course_id" class="form-select">
+        <option value="">— None (non-academy) —</option>
+        <?php foreach ($allCoursesList as $c): ?>
+            <option value="<?php echo (int)$c['id']; ?>" data-divisions='<?php echo e(json_encode($c['divisions'], JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT)); ?>'>
+                <?php echo e($c['title']); ?>
+            </option>
+        <?php endforeach; ?>
+    </select>
+</div>
+
+<div class="form-row"><label>Division</label>
+    <select name="division_id" id="exam_division_id" class="form-select">
+        <option value="">— Select course first —</option>
+    </select>
+</div>
+
+<div class="form-row"><label>Week #</label>
+    <input type="number" name="week_number" id="exam_week_number" class="form-input" min="1" placeholder="e.g. 3">
+</div>
+<!-- ========== /NEW ========== -->
                 <div class="inline-row">
                     <div class="form-row"><label>Month (YYYY-MM) *</label><input type="month" name="month_year" id="month_year" class="form-input" required></div>
                     <div class="form-row"><label>Time Limit (mins)</label><input type="number" name="time_limit_minutes" id="time_limit_minutes" class="form-input"></div>
@@ -747,8 +823,17 @@ a{text-decoration:none;color:inherit} button,input,textarea,select{font:inherit}
 function showToast(m,t='success'){const c=document.getElementById('toastContainer');const d=document.createElement('div');d.className=`toast ${t}`;d.innerHTML=`<span>${t==='success'?'✅':'❌'}</span><span>${m}</span><span class="close-toast" onclick="this.parentElement.remove()">&times;</span>`;c.appendChild(d);setTimeout(()=>d.remove(),5000);}
 const modal=document.getElementById('examModal'),createBtn=document.getElementById('createExamBtn'),closeBtn=document.getElementById('closeModalBtn'),cancelBtn=document.getElementById('cancelModalBtn'),form=document.getElementById('examForm'),modalTitle=document.getElementById('modalTitle');
 function openModal(data=null){
-    if(data){modalTitle.textContent='Edit Monthly Exam';document.getElementById('exam_id').value=data.id||0;document.getElementById('title').value=data.title||'';document.getElementById('slug').value=data.slug||'';document.getElementById('description').value=data.description||'';document.getElementById('subject_id').value=data.subject_id||'';document.getElementById('month_year').value=data.month_year||'';document.getElementById('time_limit_minutes').value=data.time_limit_minutes||'';document.getElementById('start_date').value=data.start_date?data.start_date.replace(' ','T').slice(0,16):'';document.getElementById('end_date').value=data.end_date?data.end_date.replace(' ','T').slice(0,16):'';document.getElementById('passing_score').value=data.passing_score||70;document.getElementById('max_attempts').value=data.max_attempts||1;document.getElementById('status').value=data.status||'draft';document.getElementById('allow_access').checked=(data.allow_access==null||data.allow_access==1);}
-    else{modalTitle.textContent='Create Monthly Exam';form.reset();document.getElementById('exam_id').value='0';}
+    if(data){modalTitle.textContent='Edit Monthly Exam';document.getElementById('exam_id').value=data.id||0;document.getElementById('title').value=data.title||'';document.getElementById('slug').value=data.slug||'';document.getElementById('description').value=data.description||'';document.getElementById('subject_id').value=data.subject_id||'';document.getElementById('month_year').value=data.month_year||'';document.getElementById('time_limit_minutes').value=data.time_limit_minutes||'';document.getElementById('start_date').value=data.start_date?data.start_date.replace(' ','T').slice(0,16):'';document.getElementById('end_date').value=data.end_date?data.end_date.replace(' ','T').slice(0,16):'';document.getElementById('passing_score').value=data.passing_score||70;document.getElementById('max_attempts').value=data.max_attempts||1;document.getElementById('status').value=data.status||'draft';document.getElementById('allow_access').checked=(data.allow_access==null||data.allow_access==1);
+        // NEW: pre-fill academy fields
+        const cs=document.getElementById('exam_course_id');
+        if(cs){cs.value=data.course_id||'';cs.dispatchEvent(new Event('change'));}
+        setTimeout(()=>{const ds=document.getElementById('exam_division_id');if(ds)ds.value=data.division_id||'';const wk=document.getElementById('exam_week_number');if(wk)wk.value=data.week_number||'';},0);
+    }
+    else{modalTitle.textContent='Create Monthly Exam';form.reset();document.getElementById('exam_id').value='0';
+        // NEW: reset academy fields
+        const cs=document.getElementById('exam_course_id');if(cs){cs.value='';cs.dispatchEvent(new Event('change'));}
+        setTimeout(()=>{const ds=document.getElementById('exam_division_id');if(ds)ds.value='';const wk=document.getElementById('exam_week_number');if(wk)wk.value='';},0);
+    }
     modal.style.display='flex';document.body.style.overflow='hidden';
 }
 function closeModal(){modal.style.display='none';document.body.style.overflow='';}
@@ -771,6 +856,39 @@ const st=localStorage.getItem('theme');if(st==='dark'){b.classList.add('dark-mod
 tt?.addEventListener('click',()=>{b.classList.toggle('dark-mode');const d=b.classList.contains('dark-mode');tt.textContent=d?'☀':'🌙';localStorage.setItem('theme',d?'dark':'light');});
 let cl=localStorage.getItem('language')||'EN';if(lt){lt.textContent=cl;lt.addEventListener('click',()=>{cl=cl==='EN'?'SW':'EN';lt.textContent=cl;localStorage.setItem('language',cl);});}
 pt?.addEventListener('click',e=>{e.stopPropagation();pm?.classList.toggle('show');});document.addEventListener('click',e=>{if(!pa?.contains(e.target))pm?.classList.remove('show');});})();
+
+</script>
+<script>
+(function () {
+    const courseSel   = document.getElementById('exam_course_id');
+    const divisionSel = document.getElementById('exam_division_id');
+    const weekInput   = document.getElementById('exam_week_number');
+
+    if (!courseSel || !divisionSel) return;
+
+    function refreshDivisions() {
+        const opt = courseSel.options[courseSel.selectedIndex];
+        const divisionsJson = opt?.dataset?.divisions || '[]';
+        let divisions = [];
+        try { divisions = JSON.parse(divisionsJson); } catch (e) {}
+
+        divisionSel.innerHTML = '';
+        if (!divisions.length) {
+            divisionSel.innerHTML = '<option value="">— Select course first —</option>';
+            return;
+        }
+        divisionSel.innerHTML = '<option value="">— Choose division —</option>';
+        divisions.forEach(d => {
+            const o = document.createElement('option');
+            o.value = d.id;
+            o.textContent = '#' + d.number + ' — ' + d.name;
+            divisionSel.appendChild(o);
+        });
+    }
+
+    courseSel.addEventListener('change', refreshDivisions);
+    refreshDivisions(); // initial
+})();
 </script>
 </body>
 </html>
