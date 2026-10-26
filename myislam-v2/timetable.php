@@ -132,6 +132,81 @@ function ttEndTime(?string $start, ?int $durationMinutes): ?string {
          . ':' . str_pad((string)($total % 60), 2, '0', STR_PAD_LEFT);
 }
 
+/**
+ * Build the correct academy URL for a timetable item.
+ *
+ * The courseLoadDivisionTimetable() helper returns a $it['link'] built
+ * against the LEGACY readers (content.php, quiz_take.php at the root).
+ * We replace it here with the academy equivalents:
+ *
+ *   content → course_subject.php?course_id=...&subject_id=...&lesson=...
+ *   quiz    → admin/quiz_take.php?slug=<quiz.slug>  (falls back to ?id=)
+ *   exam    → take_semester_exam.php?exam_id=...   (or monthly by probing source)
+ *
+ * The result is always a URL relative to the app root, so it works whether
+ * timetable.php lives at / or /admin/.
+ */
+function ttResolveLink(PDO $conn, int $courseId, array $it): string
+{
+    $type   = (string)($it['item_type'] ?? '');
+    $itemId = (int)($it['item_id'] ?? 0);
+    $sid    = (int)($it['subject_id'] ?? 0);
+
+    if ($itemId <= 0) {
+        return '';
+    }
+
+    if ($type === 'content') {
+        if ($sid <= 0) return '';
+        return 'course_subject.php?course_id=' . $courseId
+             . '&subject_id=' . $sid
+             . '&lesson=' . $itemId;
+    }
+
+    if ($type === 'quiz') {
+        // Prefer slug (stable, admin-editable) — fall back to numeric id.
+        try {
+            $stmt = $conn->prepare("SELECT slug FROM quizzes WHERE id = ? LIMIT 1");
+            $stmt->execute([$itemId]);
+            $slug = trim((string)$stmt->fetchColumn());
+            if ($slug !== '') {
+                return 'admin/quiz_take.php?slug=' . urlencode($slug);
+            }
+        } catch (PDOException $e) {
+            error_log('ttResolveLink quiz slug: ' . $e->getMessage());
+        }
+        return 'admin/quiz_take.php?id=' . $itemId;
+    }
+
+    if ($type === 'exam') {
+        // Exam ids live in BOTH monthly_exams and semester_exams.
+        // Prefer whichever table actually has this id, checking semester first
+        // (the academy's primary exam type).
+        try {
+            $stmt = $conn->prepare("SELECT 1 FROM semester_exams WHERE id = ? LIMIT 1");
+            $stmt->execute([$itemId]);
+            if ($stmt->fetchColumn()) {
+                return 'take_semester_exam.php?exam_id=' . $itemId;
+            }
+        } catch (PDOException $e) {
+            error_log('ttResolveLink exam semester: ' . $e->getMessage());
+        }
+
+        try {
+            $stmt = $conn->prepare("SELECT 1 FROM monthly_exams WHERE id = ? LIMIT 1");
+            $stmt->execute([$itemId]);
+            if ($stmt->fetchColumn()) {
+                return 'take_monthly_exam.php?exam_id=' . $itemId;
+            }
+        } catch (PDOException $e) {
+            error_log('ttResolveLink exam monthly: ' . $e->getMessage());
+        }
+    }
+
+    // Fallback: whatever the helper gave us (or nothing).
+    return (string)($it['link'] ?? '');
+}
+
 courseShellStart($ctx, 'Timetable — ' . $en['course_title'] . ' — ' . $curDiv['name']);
 ?>
 
@@ -401,13 +476,15 @@ courseShellStart($ctx, 'Timetable — ' . $en['course_title'] . ' — ' . $curDi
         white-space: nowrap;
         min-width: 0;
     }
-.tt-actions-stack {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-end;
-    gap: 8px;
-    flex-shrink: 0;
-}
+    .tt-title {
+        font-size: 11px;
+        color: var(--muted);
+        font-weight: 600;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        min-width: 0;
+    }
 
     /* Far-right column: type badge stacked ABOVE the Open button — always */
     .tt-actions-stack {
@@ -502,7 +579,7 @@ courseShellStart($ctx, 'Timetable — ' . $en['course_title'] . ' — ' . $curDi
         .tt-time .e { font-size: 8.5px; }
         .tt-subject { font-size: 12px; }
         .tt-title { font-size: 10.5px; }
-.tt-actions-stack { gap: 10px; }
+        .tt-actions-stack { gap: 4px; }
         .tt-type-badge { font-size: 8px; padding: 1px 6px; }
         .tt-action { padding: 4px 9px; font-size: 10px; }
     }
@@ -630,6 +707,9 @@ foreach ($weekItems as $day) { $totalItems += count($day); }
                         $typeLabel = COURSE_ITEM_LABELS[$type] ?? ucfirst($type);
                         $endTime = ttEndTime($it['start_time'] ?? null, $it['duration'] ?? null);
                         $actionClass = $type === 'quiz' ? 'tt-action gold' : ($type === 'exam' ? 'tt-action accent' : 'tt-action');
+
+                        // Resolve the correct academy URL — bypass the legacy $it['link'].
+                        $academyLink = ttResolveLink($conn, $courseId, $it);
                     ?>
                         <div class="tt-item type-<?php echo e($type); ?>">
                             <?php if ($it['start_time']): ?>
@@ -652,8 +732,8 @@ foreach ($weekItems as $day) { $totalItems += count($day); }
                             <div class="tt-actions-stack">
                                 <span class="tt-type-badge <?php echo e($type); ?>"><?php echo e($typeLabel); ?></span>
 
-                                <?php if (!empty($it['link'])): ?>
-                                    <a class="<?php echo e($actionClass); ?>" href="<?php echo e($it['link']); ?>">Open →</a>
+                                <?php if ($academyLink !== ''): ?>
+                                    <a class="<?php echo e($actionClass); ?>" href="<?php echo e($academyLink); ?>">Open →</a>
                                 <?php else: ?>
                                     <span style="font-size:10px;color:var(--muted);">—</span>
                                 <?php endif; ?>

@@ -1892,15 +1892,28 @@ body.dark-mode::before{background-image:url("data:image/svg+xml,%3Csvg xmlns='ht
         <h3>📻 Radio Qur-aan 24×7</h3>
         <div class="zd-radio-wrap">
           <p>Live Radio Qur-aan</p>
-          <audio src="https://stream.zeno.fm/dok66ovac9guv" controls></audio>
+          <audio src="https://n06.radiojar.com/4wqre23fytzuv?rj-ttl=5&rj-tok=AAABlQvhHG4At732cmFHSctAHA" controls></audio>
         </div>
-      </div>
-
-      <div class="zd-radio">
-        <h3>📻 Radio Mawaidha 24×7</h3>
+        <h3>📻 Radio Ya sunnah 24×7</h3>
         <div class="zd-radio-wrap">
-          <p>Live Radio Mawaidha</p>
-          <audio src="https://stream.zeno.fm/ydvkzahuiuatv" controls></audio>
+          <p>Live Radio Ya sunnah</p>
+          <audio src="https://stream.zeno.fm/aaonaqopnq5tv" controls></audio>
+        </div>
+        <h3>📻 Radio Ya mawaidha 24×7</h3>
+        <div class="zd-radio-wrap">
+          <p>Radio Ya mawaidha</p>
+          <audio src="https://stream.zeno.fm/aaonaqopnq5tv" controls></audio>
+        </div>
+        <h3>📻 Masjid A'aisha Mombasa 24×7</h3>
+        <div class="zd-radio-wrap">
+          <p>Masjid A'aisha Mombasa </p>
+          <audio src="https://stream.zeno.fm/uvuqmseyrtbtv" controls></audio>
+        </div>
+        <div class="zd-radio">
+        <h3>📻 Radio Masjid irshada Ilala Dsm 24×7</h3>
+        <div class="zd-radio-wrap">
+          <p>Redio Masjid  Irshada Ilala DSM </p>
+          <audio src="https://stream.zeno.fm/k7eq8xhp168uv" controls></audio>
         </div>
       </div>
 
@@ -1989,3 +2002,5 @@ body.dark-mode::before{background-image:url("data:image/svg+xml,%3Csvg xmlns='ht
 </script>
 </body>
 </html>
+
+

@@ -196,7 +196,6 @@ function subjectItemWindow(array $row, array $itemData, DateTimeImmutable $divSt
     $wd   = max(1, min(7, (int)($row['weekday'] ?? 1)));
     $time = !empty($row['start_time']) ? (string)$row['start_time'] : '00:00:00';
 
-    // Guard against 'HH:MM' or 'HH:MM:SS' formats.
     $hh = (int)substr($time, 0, 2);
     $mm = (int)substr($time, 3, 2);
     $ss = strlen($time) >= 8 ? (int)substr($time, 6, 2) : 0;
@@ -223,9 +222,6 @@ function subjectItemWindow(array $row, array $itemData, DateTimeImmutable $divSt
     return [$unlock, $lockAt];
 }
 
-/**
- * Latest completed attempt for a quiz, course-scoped, tolerant of legacy NULL.
- */
 function subjectQuizAttemptState(
     PDO $conn,
     int $userId,
@@ -238,13 +234,9 @@ function subjectQuizAttemptState(
     ?DateTimeImmutable $lockAt
 ): array {
     $windowState = 'live';
-    if ($lockAt === null) {
-        $windowState = 'no_window';
-    } elseif ($now < $unlockAt) {
-        $windowState = 'upcoming';
-    } elseif ($now > $lockAt) {
-        $windowState = 'ended';
-    }
+    if ($lockAt === null) $windowState = 'no_window';
+    elseif ($now < $unlockAt) $windowState = 'upcoming';
+    elseif ($now > $lockAt) $windowState = 'ended';
 
     $isCompetition = (($quizRow['mode'] ?? '') === 'competition');
     $attempted = false;
@@ -252,7 +244,6 @@ function subjectQuizAttemptState(
     $passed = null;
     $attemptId = null;
 
-    // Course-scoped filter — tolerant of legacy rows with NULL course_id/enrollment_id.
     $scopeSql = "
         AND (course_id = :course_id OR course_id IS NULL)
         AND (enrollment_id = :enrollment_id OR enrollment_id IS NULL)
@@ -318,10 +309,6 @@ function subjectQuizAttemptState(
     ];
 }
 
-/**
- * Latest completed attempt for a monthly OR semester exam, course-scoped,
- * tolerant of legacy NULL rows.
- */
 function subjectExamAttemptState(
     PDO $conn,
     int $userId,
@@ -334,13 +321,9 @@ function subjectExamAttemptState(
     ?DateTimeImmutable $lockAt
 ): array {
     $windowState = 'live';
-    if ($lockAt === null) {
-        $windowState = 'no_window';
-    } elseif ($now < $unlockAt) {
-        $windowState = 'upcoming';
-    } elseif ($now > $lockAt) {
-        $windowState = 'ended';
-    }
+    if ($lockAt === null) $windowState = 'no_window';
+    elseif ($now < $unlockAt) $windowState = 'upcoming';
+    elseif ($now > $lockAt) $windowState = 'ended';
 
     $source = (string)($examRow['_source'] ?? 'monthly');
     $table  = ($source === 'semester') ? 'semester_exam_attempts' : 'monthly_exam_attempts';
@@ -350,7 +333,6 @@ function subjectExamAttemptState(
     $passed = null;
     $attemptId = null;
 
-    // Course-scoped filter — tolerant of legacy rows with NULL course_id/enrollment_id.
     $scopeSql = "
         AND (course_id = :course_id OR course_id IS NULL)
         AND (enrollment_id = :enrollment_id OR enrollment_id IS NULL)
@@ -593,7 +575,7 @@ foreach ($visibleItems as $it) $visibleByWeek[$it['week']][] = $it;
 ksort($visibleByWeek);
 
 // ---------------------------------------------------------------------------
-// LESSON READER — mirrors content.php rendering
+// LESSON READER
 // ---------------------------------------------------------------------------
 $readingLesson = null;
 $readingParts = [];
@@ -799,10 +781,8 @@ if ($lessonId > 0) {
 }
 
 // ---------------------------------------------------------------------------
-// LEFT COLUMN — weekly + monthly scores (course-scoped, tolerant of legacy NULL)
+// LEFT COLUMN — weekly + monthly scores
 // ---------------------------------------------------------------------------
-
-// Weekly quizzes
 $weeklyScores = [];
 try {
     $stmt = $conn->prepare("
@@ -837,7 +817,6 @@ try {
     error_log('course_subject.php weeklyScores: ' . $e->getMessage());
 }
 
-// Monthly exams (course-scoped)
 $monthlyScores = [];
 try {
     $stmt = $conn->prepare("
@@ -885,8 +864,169 @@ if ($monthlyScores) {
     } catch (PDOException $e) {}
 }
 
+// ============================================================================
+// EXAM RESULTS
+// ============================================================================
+$courseExamResults = [];
+try {
+    $enrId = $currentEnrollmentId;
+
+    try {
+        $stmt = $conn->prepare("
+            SELECT 'weekly' AS source, qa.id AS attempt_id, qa.quiz_id AS exam_id,
+                   'quiz' AS exam_type, q.title, qa.attempt_number,
+                   qa.score, qa.total_points, qa.percentage, qa.passed, qa.completed_at
+            FROM quiz_attempts qa
+            JOIN quizzes q ON q.id = qa.quiz_id
+            WHERE qa.user_id = ? AND qa.status = 'completed'
+              AND q.course_id = ?
+              AND q.subject_id = ?
+              AND (qa.enrollment_id = ? OR qa.enrollment_id IS NULL)
+        ");
+        $stmt->execute([$userId, $courseId, $subjectId, $enrId]);
+        foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) $courseExamResults[] = $row;
+    } catch (PDOException $e) {
+        error_log('course_subject.php exam results weekly: ' . $e->getMessage());
+    }
+
+    try {
+        $stmt = $conn->prepare("
+            SELECT 'monthly' AS source, mea.id AS attempt_id, mea.exam_id AS exam_id,
+                   'monthly' AS exam_type, me.title, mea.attempt_number,
+                   mea.score, mea.total_points, mea.percentage, mea.passed, mea.completed_at
+            FROM monthly_exam_attempts mea
+            JOIN monthly_exams me ON me.id = mea.exam_id
+            WHERE mea.user_id = ? AND mea.status = 'completed'
+              AND me.course_id = ?
+              AND me.subject_id = ?
+              AND (mea.enrollment_id = ? OR mea.enrollment_id IS NULL)
+        ");
+        $stmt->execute([$userId, $courseId, $subjectId, $enrId]);
+        foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) $courseExamResults[] = $row;
+    } catch (PDOException $e) {
+        error_log('course_subject.php exam results monthly: ' . $e->getMessage());
+    }
+
+    try {
+        $stmt = $conn->prepare("
+            SELECT 'semester' AS source, sea.id AS attempt_id, sea.exam_id AS exam_id,
+                   se.exam_type, se.title, sea.attempt_number,
+                   sea.score, sea.total_points, sea.percentage, sea.passed, sea.completed_at
+            FROM semester_exam_attempts sea
+            JOIN semester_exams se ON se.id = sea.exam_id
+            JOIN course_subjects cs ON cs.id = se.course_subject_id
+            WHERE sea.user_id = ? AND sea.status = 'completed'
+              AND cs.course_id = ?
+              AND cs.subject_id = ?
+              AND (sea.enrollment_id = ? OR sea.enrollment_id IS NULL)
+        ");
+        $stmt->execute([$userId, $courseId, $subjectId, $enrId]);
+        foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) $courseExamResults[] = $row;
+    } catch (PDOException $e) {
+        error_log('course_subject.php exam results semester: ' . $e->getMessage());
+    }
+
+    usort($courseExamResults, static function ($a, $b) {
+        return strtotime((string)($b['completed_at'] ?? '')) <=> strtotime((string)($a['completed_at'] ?? ''));
+    });
+} catch (Throwable $e) {
+    error_log('course_subject.php exam results outer: ' . $e->getMessage());
+}
+
+// ============================================================================
+// Top scorers per attempt — course + subject scoped
+// ============================================================================
+$topScorersByAttempt = [];
+if ($courseExamResults) {
+    $attemptKeys = [];
+    foreach ($courseExamResults as $r) {
+        $key = $r['source'] . ':' . (int)$r['exam_id'];
+        if (!isset($attemptKeys[$key])) {
+            $attemptKeys[$key] = ['source' => $r['source'], 'exam_id' => (int)$r['exam_id']];
+        }
+    }
+
+    foreach ($attemptKeys as $k => $a) {
+        try {
+            if ($a['source'] === 'weekly') {
+                $stmt = $conn->prepare("
+                    SELECT u.id AS user_id, u.username, u.full_name, u.profile_image,
+                           MAX(qa.score) AS best_points,
+                           MAX(qa.total_points) AS best_total
+                    FROM quiz_attempts qa
+                    JOIN users u ON u.id = qa.user_id
+                    JOIN quizzes q ON q.id = qa.quiz_id
+                    WHERE qa.quiz_id = ?
+                      AND qa.status = 'completed'
+                      AND u.is_active = 1
+                      AND q.course_id = ?
+                      AND q.subject_id = ?
+                    GROUP BY u.id, u.username, u.full_name, u.profile_image
+                    ORDER BY best_points DESC, best_total DESC, u.id ASC
+                    LIMIT 5
+                ");
+                $stmt->execute([$a['exam_id'], $courseId, $subjectId]);
+            } elseif ($a['source'] === 'monthly') {
+                $stmt = $conn->prepare("
+                    SELECT u.id AS user_id, u.username, u.full_name, u.profile_image,
+                           MAX(mea.score) AS best_points,
+                           MAX(mea.total_points) AS best_total
+                    FROM monthly_exam_attempts mea
+                    JOIN users u ON u.id = mea.user_id
+                    JOIN monthly_exams me ON me.id = mea.exam_id
+                    WHERE mea.exam_id = ?
+                      AND mea.status = 'completed'
+                      AND u.is_active = 1
+                      AND me.course_id = ?
+                      AND me.subject_id = ?
+                    GROUP BY u.id, u.username, u.full_name, u.profile_image
+                    ORDER BY best_points DESC, best_total DESC, u.id ASC
+                    LIMIT 5
+                ");
+                $stmt->execute([$a['exam_id'], $courseId, $subjectId]);
+            } else {
+                $stmt = $conn->prepare("
+                    SELECT u.id AS user_id, u.username, u.full_name, u.profile_image,
+                           MAX(sea.score) AS best_points,
+                           MAX(sea.total_points) AS best_total
+                    FROM semester_exam_attempts sea
+                    JOIN users u ON u.id = sea.user_id
+                    JOIN semester_exams se ON se.id = sea.exam_id
+                    JOIN course_subjects cs ON cs.id = se.course_subject_id
+                    WHERE sea.exam_id = ?
+                      AND sea.status = 'completed'
+                      AND u.is_active = 1
+                      AND cs.course_id = ?
+                      AND cs.subject_id = ?
+                    GROUP BY u.id, u.username, u.full_name, u.profile_image
+                    ORDER BY best_points DESC, best_total DESC, u.id ASC
+                    LIMIT 5
+                ");
+                $stmt->execute([$a['exam_id'], $courseId, $subjectId]);
+            }
+
+            $rows = $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
+            $rank = 1;
+            $topScorersByAttempt[$k] = [];
+            foreach ($rows as $row) {
+                $name = trim((string)($row['username'] ?: ($row['full_name'] ?: 'User')));
+                $topScorersByAttempt[$k][] = [
+                    'rank'         => $rank++,
+                    'display_name' => ((int)$row['user_id'] === $userId) ? 'You' : $name,
+                    'initials'     => strtoupper(mb_substr($name, 0, 2)),
+                    'is_me'        => ((int)$row['user_id'] === $userId),
+                    'points'       => (int)$row['best_points'],
+                    'budget'       => (int)$row['best_total'],
+                ];
+            }
+        } catch (PDOException $e) {
+            error_log('course_subject.php top scorers ' . $k . ': ' . $e->getMessage());
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
-// MARKAZ IMAGE — DB-first, then slug fallback
+// MARKAZ IMAGE
 // ---------------------------------------------------------------------------
 $sheikhBgPath = '';
 $sheikhBgOk   = false;
@@ -927,7 +1067,6 @@ if (!$sheikhBgOk) {
     }
 }
 
-// HERO IMAGE — subject's own image, or markaz image as fallback
 $heroBg = '';
 if (!empty($subject['image_path'])) {
     $candidate = trim((string)$subject['image_path']);
@@ -1018,6 +1157,8 @@ courseShellStart($ctx, ($subject['name'] ?? 'Subject') . ' — ' . ($en['course_
     .zs-panel { background: var(--surface); border: 1px solid var(--line); border-radius: 5px; margin-bottom: 10px; overflow: hidden; }
     .zs-panel-head { padding: 8px 12px; font-size: 12px; font-weight: 800; text-transform: uppercase; letter-spacing: .8px; color: var(--gold); border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 8px; }
     .zs-panel-head small { font-size: 10.5px; font-weight: 600; color: var(--muted); text-transform: none; letter-spacing: 0; }
+    .zs-panel-head[data-subject-scorers-toggle] { cursor: pointer; user-select: none; }
+    .zs-panel-head[data-subject-scorers-toggle]:hover { background: var(--surface-2); }
     .zs-panel-body { padding: 10px 12px; }
 
     /* ============ SCORE LISTS ============ */
@@ -1106,7 +1247,6 @@ courseShellStart($ctx, ($subject['name'] ?? 'Subject') . ' — ' . ($en['course_
     .zs-media-download { margin-top: 8px; text-align: center; }
     .zs-media-download .btn { padding: 6px 12px; font-size: 12px; border-radius: 5px; }
 
-    /* ---- Sections (matches content.php) ---- */
     .zs-sections-container { display: flex; flex-direction: column; gap: 10px; }
     .zs-section-display {
         padding: 12px 14px;
@@ -1123,7 +1263,6 @@ courseShellStart($ctx, ($subject['name'] ?? 'Subject') . ' — ' . ($en['course_
     }
     .zs-section-body { font-size: 14px; line-height: 1.7; }
 
-    /* ---- Combined mode ---- */
     .zs-combined-content {
         padding: 12px 14px;
         border-radius: 5px;
@@ -1171,6 +1310,277 @@ courseShellStart($ctx, ($subject['name'] ?? 'Subject') . ' — ' . ($en['course_
     .zs-toc-item .zs-toc-meta { display: block; font-size: 10px; color: var(--muted); font-weight: 600; }
     .zs-toc-empty { padding: 16px 12px; text-align: center; font-size: 12px; color: var(--muted); }
 
+    /* ============ EXAM RESULTS CARD ============ */
+    .er-subject {
+        border: 1px solid var(--line);
+        border-radius: 5px;
+        overflow: hidden;
+        margin-bottom: 6px;
+        background: var(--surface);
+    }
+    .er-subject:last-child { margin-bottom: 0; }
+    .er-subject-head {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 9px 12px;
+        background: var(--surface-2);
+        border-bottom: 1px solid var(--line);
+        flex-wrap: wrap;
+        cursor: pointer;
+        user-select: none;
+        transition: background .12s;
+    }
+    .er-subject-head:hover { background: var(--surface-3); }
+    .er-subject .er-list { display: none; }
+    .er-subject.open .er-list { display: grid; }
+    .er-subject.open .er-subject-head { border-bottom-color: var(--line); }
+    .er-subject:not(.open) .er-subject-head { border-bottom-color: transparent; }
+
+    .er-caret {
+        margin-left: auto;
+        font-size: 11px;
+        color: var(--muted);
+        transition: transform .15s;
+        flex-shrink: 0;
+    }
+    .er-subject.open .er-caret { transform: rotate(180deg); }
+
+    .er-subject-head .er-ico { font-size: 16px; flex-shrink: 0; }
+    .er-subject-head .er-title {
+        font-weight: 800;
+        font-size: 13px;
+        color: var(--text);
+        direction: rtl;
+        text-align: right;
+        unicode-bidi: isolate;
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .er-subject-head .er-summary {
+        font-size: 10.5px;
+        color: var(--muted);
+        font-weight: 700;
+        white-space: nowrap;
+    }
+
+    .er-list { display: grid; }
+    .er-row {
+        display: grid;
+        grid-template-columns: 32px minmax(0, 1fr) auto;
+        gap: 10px;
+        align-items: center;
+        padding: 9px 12px;
+        border-bottom: 1px solid var(--line);
+        border-left: 3px solid var(--brand);
+        background: var(--surface);
+        cursor: pointer;
+        transition: background .12s;
+        text-decoration: none;
+        color: inherit;
+    }
+    .er-row:last-child { border-bottom: none; }
+    .er-row:hover { background: var(--surface-2); }
+    .er-row.is-weekly  { border-left-color: var(--gold); }
+    .er-row.is-monthly { border-left-color: #3E6E91; }
+    .er-row.is-semester{ border-left-color: var(--brand); }
+    .er-row.is-supp    { border-left-color: var(--gold); }
+    .er-row.is-failed  { border-left-color: var(--danger); }
+    .er-row.expanded   { background: var(--brand-soft); }
+
+    .er-icon {
+        width: 30px; height: 30px;
+        border-radius: 5px;
+        display: flex; align-items: center; justify-content: center;
+        font-size: 14px;
+        background: rgba(14,74,52,.08);
+        color: var(--brand);
+    }
+    .er-row.is-weekly  .er-icon { background: rgba(156,122,46,.12); color: var(--gold); }
+    .er-row.is-monthly .er-icon { background: rgba(62,110,145,.10); color: #3E6E91; }
+    .er-row.is-supp    .er-icon { background: rgba(156,122,46,.12); color: var(--gold); }
+    .er-row.is-failed  .er-icon { background: rgba(185,28,28,.10); color: var(--danger); }
+
+    .er-body { min-width: 0; direction: rtl; text-align: right; }
+    .er-title-row {
+        font-size: 12.5px;
+        font-weight: 700;
+        color: var(--text);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        margin-bottom: 2px;
+        direction: rtl;
+        unicode-bidi: isolate;
+    }
+    .er-meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 2px 10px;
+        font-size: 10px;
+        color: var(--muted);
+        font-weight: 600;
+        direction: rtl;
+        justify-content: flex-end;
+    }
+    .er-meta span {
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 180px;
+    }
+
+    .er-right {
+        text-align: right;
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        gap: 2px;
+        white-space: nowrap;
+    }
+    .er-score {
+        font-size: 13px;
+        font-weight: 800;
+        color: var(--brand);
+        line-height: 1.1;
+    }
+    .er-score.fail { color: var(--danger); }
+    .er-score small { font-size: 9.5px; color: var(--muted); font-weight: 700; margin-left: 1px; }
+    .er-pct { font-size: 10px; font-weight: 700; color: var(--muted); }
+    .er-pill {
+        display: inline-block;
+        padding: 1px 6px;
+        border-radius: 999px;
+        font-size: 9px;
+        font-weight: 800;
+        text-transform: uppercase;
+    }
+    .er-pill.pass { background: rgba(14,74,52,.10); color: var(--brand); }
+    .er-pill.fail { background: rgba(185,28,28,.10); color: var(--danger); }
+
+    .er-detail {
+        padding: 10px 12px;
+        background: var(--surface-2);
+        border-top: 1px dashed var(--line);
+        font-size: 11.5px;
+        color: var(--text-secondary);
+        display: none;
+    }
+    .er-detail.open { display: block; }
+    .er-detail-loading { padding: 14px 4px; text-align: center; color: var(--muted); }
+
+    .er-detail .er-q {
+        padding: 8px 10px;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-left: 3px solid var(--brand);
+        border-radius: 5px;
+        margin-bottom: 5px;
+    }
+    .er-detail .er-q.wrong { border-left-color: var(--danger); }
+    .er-q-head {
+        display: flex;
+        gap: 5px;
+        align-items: flex-start;
+        font-size: 11.5px;
+        font-weight: 700;
+        color: var(--text);
+        margin-bottom: 4px;
+        overflow-wrap: anywhere;
+    }
+    .er-q-head .num {
+        background: var(--surface-2);
+        border-radius: 999px;
+        padding: 1px 6px;
+        font-size: 9.5px;
+        color: var(--muted);
+        font-weight: 800;
+        flex-shrink: 0;
+    }
+    .er-q-line {
+        display: flex;
+        gap: 6px;
+        font-size: 10.5px;
+        margin-bottom: 2px;
+        overflow-wrap: anywhere;
+    }
+    .er-q-line .k { color: var(--muted); font-weight: 700; flex-shrink: 0; min-width: 58px; }
+    .er-q-line .val { color: var(--text); font-weight: 600; }
+    .er-q-line .val.good { color: var(--brand); }
+    .er-q-line .val.bad  { color: var(--danger); }
+
+    /* RTL ONLY on questions / answers */
+    .er-detail .er-q,
+    .er-detail .er-q-head,
+    .er-detail .er-q-line {
+        direction: rtl;
+        text-align: right;
+        unicode-bidi: isolate;
+    }
+    .er-detail .er-q-line .k,
+    .er-detail .er-q-line .val {
+        text-align: right;
+    }
+
+    .er-detail-wrap {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        gap: 12px;
+    }
+
+    .er-parts {
+        display: grid;
+        gap: 3px;
+        margin-top: 8px;
+        padding-top: 8px;
+        border-top: 1px dashed var(--line);
+    }
+    .er-parts-title {
+        font-size: 10px;
+        font-weight: 800;
+        text-transform: uppercase;
+        letter-spacing: .5px;
+        color: var(--muted);
+        margin-bottom: 4px;
+    }
+    .er-part {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        padding: 5px 8px;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 5px;
+        font-size: 11px;
+    }
+    .er-part.is-me { border-color: var(--brand); background: var(--brand-soft); }
+    .er-part-rank {
+        width: 18px; height: 18px; border-radius: 50%;
+        background: var(--surface-2); color: var(--muted);
+        display: flex; align-items: center; justify-content: center;
+        font-size: 9px; font-weight: 800; flex-shrink: 0;
+    }
+    .er-part:nth-child(2) .er-part-rank { background: #C6A64B; color: #fff; }
+    .er-part:nth-child(3) .er-part-rank { background: #8FD3E8; color: #0f1720; }
+    .er-part:nth-child(4) .er-part-rank { background: #6C5CC0; color: #fff; }
+    .er-part-name { flex: 1; min-width: 0; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .er-part-score { font-weight: 800; color: var(--gold); font-variant-numeric: tabular-nums; }
+
+    .er-empty {
+        padding: 22px 14px;
+        text-align: center;
+        color: var(--muted);
+        font-size: 12.5px;
+        background: var(--surface);
+        border: 1px dashed var(--line);
+        border-radius: 5px;
+        line-height: 1.55;
+    }
+    .er-empty .em { font-size: 28px; display: block; margin-bottom: 6px; }
+
     /* ============ MOBILE ORDER ============ */
     @media (max-width: 900px) {
         .zs-layout { display: flex !important; flex-direction: column; gap: 8px; }
@@ -1200,6 +1610,220 @@ courseShellStart($ctx, ($subject['name'] ?? 'Subject') . ' — ' . ($en['course_
         .zs-reader-head { padding: 10px 12px; }
         .zs-reader-body { padding: 10px; }
         .zs-section-display, .zs-combined-content { padding: 10px 12px; }
+    }
+
+    @media (max-width: 900px) {
+        .zs-layout { display: flex !important; flex-direction: column; gap: 8px; }
+        .zs-main, .zs-left, .zs-right { display: contents !important; }
+
+        .zs-main > .zs-hero                          { order: 1; width: 100%; }
+        .zs-right > .zs-sheikh                       { order: 2; width: 100%; }
+
+        .zs-main > *:not(.zs-hero):not(.er-section):not(.scorers-section) { order: 3; width: 100%; }
+        .zs-main > .er-section                       { order: 7; width: 100%; }
+        .zs-main > .scorers-section                  { order: 8; width: 100%; }
+
+        .zs-left > .zs-panel:nth-of-type(1)          { order: 4; width: 100%; } /* Weekly quizzes */
+        .zs-left > .zs-panel:nth-of-type(2)          { order: 5; width: 100%; } /* Monthly exams  */
+        .zs-left > .zs-panel:nth-of-type(3)          { order: 9; width: 100%; } /* Overall        */
+
+        .zs-right > .zs-panel                        { order: 6; width: 100%; } /* TOC            */
+        .zs-left > .zs-cert                          { order: 10; width: 100%; } /* Certificates   */
+
+        .zs-layout > *, .zs-main > *, .zs-left > *, .zs-right > * { width: 100%; min-width: 0; }
+        .zs-hero, .zs-panel, .zs-sheikh, .zs-cert { margin-bottom: 0; }
+    }
+
+    /* ============================================================
+       MOBILE FIT
+       ============================================================ */
+    html, body { max-width: 100%; overflow-x: hidden; }
+    .zs-layout, .zs-layout *,
+    .zs-panel, .zs-panel *,
+    .zs-main, .zs-main *,
+    .zs-left, .zs-left *,
+    .zs-right, .zs-right * { box-sizing: border-box; min-width: 0; }
+
+    .zs-hero h1,
+    .zs-hero .meta,
+    .zs-item-title,
+    .zs-item-meta,
+    .zs-toc-title,
+    .zs-toc-meta,
+    .zs-score-row .t,
+    .er-title-row,
+    .er-meta span,
+    .zs-reader-head h1,
+    .zs-section-body,
+    .zs-combined-content { overflow-wrap: anywhere; word-break: break-word; }
+
+    .zs-media video, .zs-media iframe, .zs-media audio,
+    .zs-hero, .zs-sheikh, .zs-cert-preview { max-width: 100%; }
+
+    .zs-layout { width: 100%; }
+
+    @media (max-width: 900px) {
+        .zs-layout { display: flex !important; flex-direction: column; gap: 10px; padding: 0; width: 100%; }
+        .zs-main, .zs-left, .zs-right { display: contents !important; }
+
+        .zs-main > .zs-hero                          { order: 1; width: 100%; }
+        .zs-right > .zs-sheikh                       { order: 2; width: 100%; }
+        .zs-main > *:not(.zs-hero):not(.er-section):not(.scorers-section) { order: 3; width: 100%; }
+        .zs-left > .zs-panel:nth-of-type(1)          { order: 4; width: 100%; }
+        .zs-left > .zs-panel:nth-of-type(2)          { order: 5; width: 100%; }
+        .zs-right > .zs-panel                        { order: 6; width: 100%; }
+        .zs-main > .er-section                       { order: 7; width: 100%; }
+        .zs-main > .scorers-section                  { order: 8; width: 100%; }
+        .zs-left > .zs-panel:nth-of-type(3)          { order: 9; width: 100%; }
+        .zs-left > .zs-cert                          { order: 10; width: 100%; }
+
+        .zs-hero, .zs-panel, .zs-sheikh, .zs-cert { margin-bottom: 0; }
+
+        .zs-item      { padding: 12px 12px; gap: 10px; min-height: 64px; }
+        .zs-item-icon { width: 44px; height: 44px; font-size: 20px; }
+        .zs-item-title { font-size: 15px; line-height: 1.35; }
+        .zs-item-meta  { font-size: 12px; gap: 6px 10px; }
+        .zs-item-action { font-size: 13px; }
+
+        .zs-toc-item { padding: 10px; font-size: 13.5px; min-height: 44px; }
+        .zs-toc-item .zs-toc-icon { width: 26px; height: 26px; font-size: 12px; }
+
+        .zs-score-row { padding: 9px 0; font-size: 13.5px; }
+
+        .er-row { padding: 11px 12px; min-height: 56px; }
+        .er-icon { width: 32px; height: 32px; font-size: 15px; }
+        .er-title-row { font-size: 13px; }
+        .er-meta { font-size: 11px; }
+        .er-score { font-size: 14px; }
+        .er-pct   { font-size: 11px; }
+
+        .zs-panel .btn,
+        .zs-cert-meta .btn,
+        .zs-media-download .btn,
+        .zs-part-nav .btn {
+            min-height: 44px;
+            padding: 10px 14px;
+            font-size: 13px;
+            border-radius: 6px;
+        }
+    }
+
+    @media (max-width: 640px) {
+        .zs-layout { gap: 8px; }
+        .zs-hero { padding: 14px 12px; border-radius: 10px; margin-bottom: 0; }
+        .zs-hero h1 { font-size: clamp(18px, 5.6vw, 22px); line-height: 1.25; }
+        .zs-hero .meta { font-size: 12px; line-height: 1.4; display: flex; flex-wrap: wrap; gap: 4px 10px; }
+        .zs-hero .back { font-size: 12px; }
+
+        .zs-panel { border-radius: 8px; }
+        .zs-panel-head { padding: 10px 12px; font-size: 12px; }
+        .zs-panel-head small { font-size: 10.5px; }
+        .zs-panel-body { padding: 10px 12px; }
+
+        .zs-sheikh { border-radius: 8px; min-height: 130px; }
+        .zs-sheikh-inner { padding: 12px 14px; }
+        .zs-sheikh h3 { font-size: 15px; }
+        .zs-sheikh .markaz { font-size: 12px; }
+
+        .zs-week-head { font-size: 12px; padding: 4px 2px; }
+        .zs-item { grid-template-columns: 40px minmax(0, 1fr); padding: 10px 12px; gap: 10px; }
+        .zs-item-icon { width: 40px; height: 40px; font-size: 18px; grid-row: span 2; }
+        .zs-item-title { font-size: 14px; }
+        .zs-item-action { grid-column: 2; text-align: left; font-size: 12.5px; margin-top: 2px; }
+        .zs-item-meta { font-size: 11.5px; }
+
+        .zs-score-row { font-size: 13px; gap: 8px; }
+        .zs-score-row .v { font-size: 12.5px; }
+
+        .zs-overall .pts-line { font-size: 14px; }
+        .zs-overall .pts-line strong { font-size: 18px; }
+        .zs-overall .pts-raw  { font-size: 11px; }
+        .zs-overall .pts-budget { font-size: 10.5px; }
+        .zs-overall .status { font-size: 12.5px; }
+
+        .zs-cert-preview { height: 84px; }
+        .zs-cert-preview .ttl { font-size: 10.5px; }
+        .zs-cert-meta { padding: 10px 12px; }
+        .zs-cert-meta h4 { font-size: 13px; }
+        .zs-cert-meta p { font-size: 11.5px; }
+
+        .zs-toc-item { padding: 10px; font-size: 13px; }
+        .zs-toc-item .zs-toc-icon { width: 24px; height: 24px; font-size: 11px; }
+        .zs-toc-meta { font-size: 10.5px; }
+
+        .zs-reader-head { padding: 12px; }
+        .zs-reader-head .back-row { font-size: 12px; gap: 6px; flex-wrap: wrap; }
+        .zs-reader-head h1 { font-size: 20px; line-height: 1.3; }
+        .zs-reader-head .meta { font-size: 11.5px; gap: 6px 10px; }
+        .zs-reader-body { padding: 12px; }
+
+        .zs-section-display,
+        .zs-combined-content { padding: 12px; font-size: 14.5px; line-height: 1.7; }
+        .zs-section-display[dir="rtl"] { font-size: 1.2em; line-height: 1.9; }
+        .zs-combined-content .mixed-rtl { font-size: 1.2em; }
+
+        .zs-part-nav { flex-direction: column; gap: 8px; }
+        .zs-part-nav > div { width: 100%; }
+        .zs-part-nav .btn { width: 100%; text-align: center; }
+
+        .zs-reader-note { font-size: 12px; padding: 10px 12px; }
+
+        .er-section .er-subject-head { padding: 10px 12px; }
+        .er-subject-head .er-title  { font-size: 13px; }
+        .er-subject-head .er-summary{ font-size: 10.5px; }
+        .er-row { grid-template-columns: 32px minmax(0, 1fr); padding: 10px 12px; gap: 8px; }
+        .er-icon { width: 32px; height: 32px; font-size: 14px; grid-row: span 2; }
+        .er-right {
+            grid-column: 2;
+            flex-direction: row;
+            align-items: center;
+            justify-content: flex-start;
+            gap: 8px;
+            text-align: left;
+            margin-top: 4px;
+        }
+        .er-score { font-size: 13.5px; }
+        .er-pill { font-size: 9.5px; }
+        .er-detail { padding: 10px 12px; }
+        .er-part { font-size: 11.5px; padding: 6px 8px; }
+
+        .zs-quiz-badge { font-size: 9.5px; padding: 2px 6px; margin-left: 4px; }
+        .score-chip { font-size: 11px; padding: 3px 7px; }
+    }
+
+    @media (max-width: 400px) {
+        .zs-hero { padding: 12px 10px; }
+        .zs-hero h1 { font-size: 18px; }
+        .zs-hero .meta { font-size: 11.5px; }
+
+        .zs-panel-head { padding: 9px 10px; }
+        .zs-panel-body { padding: 9px 10px; }
+
+        .zs-item { padding: 9px 10px; gap: 8px; }
+        .zs-item-title { font-size: 13.5px; }
+        .zs-item-meta  { font-size: 11px; }
+        .zs-item-action{ font-size: 12px; }
+
+        .zs-score-row { font-size: 12.5px; }
+        .zs-score-row .v { font-size: 12px; }
+
+        .zs-toc-item { font-size: 12.5px; padding: 9px; }
+
+        .zs-reader-head h1 { font-size: 18px; }
+        .zs-reader-head .meta { font-size: 11px; }
+
+        .er-title-row { font-size: 12px; }
+        .er-meta span { max-width: 140px; }
+        .er-score { font-size: 13px; }
+    }
+
+    @media (max-width: 340px) {
+        .zs-hero h1 { font-size: 17px; }
+        .zs-item { grid-template-columns: 36px minmax(0, 1fr); }
+        .zs-item-icon { width: 36px; height: 36px; font-size: 16px; }
+        .zs-item-title { font-size: 13px; }
+        .zs-score-row { font-size: 12px; }
+        .er-title-row { font-size: 11.5px; }
     }
 </style>
 
@@ -1369,12 +1993,6 @@ courseShellStart($ctx, ($subject['name'] ?? 'Subject') . ' — ' . ($en['course_
                         <?php if (!empty($readingLesson['category_name'])): ?>
                             <span>🏷️ <?php echo e((string)$readingLesson['category_name']); ?></span>
                         <?php endif; ?>
-                        <?php if (!empty($readingCurrentPart['video_path']) || !empty($readingCurrentPart['video_url'])): ?>
-                            <span>🎬 Video</span>
-                        <?php endif; ?>
-                        <?php if (!empty($readingCurrentPart['audio_path'])): ?>
-                            <span>🎵 Audio</span>
-                        <?php endif; ?>
                     </div>
                 </div>
 
@@ -1420,7 +2038,6 @@ courseShellStart($ctx, ($subject['name'] ?? 'Subject') . ' — ' . ($en['course_
                         </div>
                     <?php endif; ?>
 
-                    <!-- ===== CONTENT DISPLAY (mirrors content.php) ===== -->
                     <?php if ($readingDisplayMode === 'combined'): ?>
                         <div class="zs-combined-content">
                             <?php echo $readingCombinedHtml; ?>
@@ -1587,6 +2204,148 @@ courseShellStart($ctx, ($subject['name'] ?? 'Subject') . ' — ' . ($en['course_
             <?php endif; ?>
         <?php endif; ?>
 
+        <!-- ========================================================= -->
+        <!-- EXAM RESULTS (this subject) -->
+        <!-- ========================================================= -->
+        <section class="zs-panel er-section" style="margin-top:10px;">
+            <div class="zs-panel-head">
+                <span>📝 Exam results</span>
+                <small>points</small>
+            </div>
+            <div class="zs-panel-body">
+                <?php if (!$courseExamResults): ?>
+                    <div class="er-empty">
+                        <span class="em">📭</span>
+                        No attempts yet.<br>
+                        Your quiz and exam results for this subject will appear here.
+                    </div>
+                <?php else:
+                    $summaryWeekly  = 0;
+                    $summaryMonthly = 0;
+                    $summaryFinal   = 0;
+                    $summarySupp    = 0;
+                    foreach ($courseExamResults as $rr) {
+                        if ($rr['source'] === 'weekly')       $summaryWeekly++;
+                        elseif ($rr['source'] === 'monthly')  $summaryMonthly++;
+                        elseif (($rr['exam_type'] ?? '') === 'supplementary') $summarySupp++;
+                        else                                  $summaryFinal++;
+                    }
+                    $summaryParts = [];
+                    if ($summaryWeekly)  $summaryParts[] = $summaryWeekly  . ' quiz'   . ($summaryWeekly  === 1 ? '' : 'zes');
+                    if ($summaryMonthly) $summaryParts[] = $summaryMonthly . ' monthly';
+                    if ($summaryFinal)   $summaryParts[] = $summaryFinal   . ' final';
+                    if ($summarySupp)    $summaryParts[] = $summarySupp    . ' supp';
+                    $summaryText = implode(' · ', $summaryParts);
+                ?>
+                    <div class="er-subject open" data-er-group>
+                        <div dir="rtl" class="er-subject-head"
+                             data-er-toggle
+                             role="button"
+                             tabindex="0"
+                             aria-expanded="true">
+                            <span class="er-ico"><?php echo e((string)($subject['icon'] ?: '📖')); ?></span>
+                            <span class="er-title"><?php echo e((string)$subject['name']); ?></span>
+                            <span class="er-summary"><?php echo e($summaryText); ?></span>
+                            <span class="er-caret" aria-hidden="true">▾</span>
+                        </div>
+
+                        <div dir="ltr" class="er-list">
+                            <?php foreach ($courseExamResults as $r):
+                                $passed   = ((int)$r['passed']) === 1;
+                                $source   = (string)$r['source'];
+                                $examType = (string)$r['exam_type'];
+
+                                $rowCls = '';
+                                $icon   = '🎓';
+                                $typeLabel = 'Final exam';
+                                if ($source === 'weekly') {
+                                    $rowCls = 'is-weekly'; $icon = '📝'; $typeLabel = 'Weekly quiz';
+                                } elseif ($source === 'monthly') {
+                                    $rowCls = 'is-monthly'; $icon = '📅'; $typeLabel = 'Monthly exam';
+                                } elseif ($examType === 'supplementary') {
+                                    $rowCls = 'is-supp'; $icon = '📚'; $typeLabel = 'Supplementary';
+                                } elseif (!$passed) {
+                                    $rowCls = 'is-failed';
+                                }
+
+                                $score    = (int)$r['score'];
+                                $totalPts = (int)$r['total_points'];
+                                $pct      = (float)$r['percentage'];
+                                $completedAt = !empty($r['completed_at']) ? strtotime((string)$r['completed_at']) : null;
+                                $dateLabel = $completedAt ? date('M d, Y · H:i', $completedAt) : '—';
+
+                                $attemptKey = $source . ':' . (int)$r['exam_id'];
+                                $topList = $topScorersByAttempt[$attemptKey] ?? [];
+                            ?>
+                                <div class="er-row <?php echo $rowCls; ?>"
+                                     data-er-row
+                                     data-source="<?php echo e($source); ?>"
+                                     data-attempt-id="<?php echo (int)$r['attempt_id']; ?>"
+                                     role="button" tabindex="0">
+                                    <div class="er-icon"><?php echo $icon; ?></div>
+                                    <div  class="er-body">
+                                        <div dir="ltr" class="er-title-row"><?php echo e($r['title'] ?: 'Untitled'); ?></div>
+                                        <div class="er-meta">
+                                            <span>🏷️ <?php echo e($typeLabel); ?></span>
+                                            <span>🔁 #<?php echo (int)$r['attempt_number']; ?></span>
+                                            <span>📅 <?php echo e($dateLabel); ?></span>
+                                        </div>
+                                    </div>
+                                    <div class="er-right">
+                                        <div class="er-score <?php echo $passed ? '' : 'fail'; ?>">
+                                            <?php echo $score; ?><small> / <?php echo $totalPts; ?></small>
+                                        </div>
+                                        <span class="er-pct"><?php echo number_format($pct, 1); ?>%</span>
+                                        <span class="er-pill <?php echo $passed ? 'pass' : 'fail'; ?>">
+                                            <?php echo $passed ? 'Pass' : 'Fail'; ?>
+                                        </span>
+                                    </div>
+                                </div>
+
+                                <!-- Per-attempt top scorers + questions (hidden until expanded) -->
+                                <div class="er-detail" data-er-detail>
+                                                                        <div class="er-detail-loading" data-er-questions>Loading questions…</div>
+
+                                    <?php if ($topList): ?>
+                                        <div class="er-parts">
+                                            <div class="er-parts-title">Top scorers (this attempt)</div>
+                                            <?php foreach ($topList as $p): ?>
+                                                <div class="er-part <?php echo $p['is_me'] ? 'is-me' : ''; ?>">
+                                                    <div class="er-part-rank">#<?php echo (int)$p['rank']; ?></div>
+                                                    <div class="er-part-name"><?php echo e($p['display_name']); ?></div>
+                                                    <div class="er-part-score">
+                                                        <?php echo (int)$p['points']; ?> / <?php echo (int)$p['budget']; ?> pts
+                                                    </div>
+                                                </div>
+                                            <?php endforeach; ?>
+                                        </div>
+                                    <?php endif; ?>
+                                </div>
+                            <?php endforeach; ?>
+                        </div>
+                    </div>
+                <?php endif; ?>
+            </div>
+        </section>
+
+        <!-- ========================================================= -->
+        <!-- SUBJECT-WIDE TOP SCORERS -->
+        <!-- ========================================================= -->
+        <section class="zs-panel scorers-section"
+                 data-subject-scorers
+                 data-subject-id="<?php echo (int)$subjectId; ?>"
+                 data-course-id="<?php echo (int)$courseId; ?>"
+                 style="margin-top:10px;">
+            <div class="zs-panel-head" data-subject-scorers-toggle
+                 role="button" tabindex="0" aria-expanded="false">
+                <span>🏆 Top scorers (this subject)</span>
+                <small>points / course total</small>
+            </div>
+            <div class="zs-panel-body" data-subject-scorers-body style="display:none;">
+                <div class="er-detail-loading">Open to see top scorers…</div>
+            </div>
+        </section>
+
     </div>
 
     <!-- RIGHT COLUMN -->
@@ -1655,5 +2414,192 @@ courseShellStart($ctx, ($subject['name'] ?? 'Subject') . ' — ' . ($en['course_
     </aside>
 
 </div>
+
+<script>
+(function () {
+    /* ---- Accordion for the single subject group ---- */
+    function toggleGroup(head) {
+        var group = head.closest('.er-subject');
+        if (!group) return;
+        var willOpen = !group.classList.contains('open');
+        group.classList.toggle('open', willOpen);
+        head.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+    }
+
+    document.addEventListener('click', function (e) {
+        var h = e.target.closest('[data-er-toggle]');
+        if (!h) return;
+        if (e.target.closest('[data-er-row]')) return;
+        toggleGroup(h);
+    });
+
+    /* ---- Attempt detail: fetch questions and append below top scorers ---- */
+    function escapeHtml(s) {
+        return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+            return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+        });
+    }
+
+    function renderQuestions(box, data) {
+        if (!data || !data.ok) {
+            box.innerHTML = '<div class="er-detail-loading">'
+                + escapeHtml((data && data.message) || 'Unable to load questions.')
+                + '</div>';
+            return;
+        }
+        if (!Array.isArray(data.questions) || !data.questions.length) {
+            box.innerHTML = '<div class="er-detail-loading">No per-question detail.</div>';
+            return;
+        }
+        var html = '';
+        data.questions.forEach(function (q, i) {
+            var wrong = q.is_correct ? '' : 'wrong';
+            html += '<div class="er-q ' + wrong + '">'
+                + '<div class="er-q-head"><span class="num">#' + (i + 1) + '</span>'
+                + '<span>' + escapeHtml(q.question_text) + '</span></div>'
+                + '<div class="er-q-line"><span class="k">Your answer:</span>'
+                + '<span class="val ' + (q.is_correct ? 'good' : 'bad') + '">'
+                + (q.user_answer ? escapeHtml(q.user_answer) : '<em>—</em>') + '</span></div>';
+            if (!q.is_correct && q.correct_answer) {
+                html += '<div class="er-q-line"><span class="k">Correct:</span>'
+                    + '<span class="val good">' + escapeHtml(q.correct_answer) + '</span></div>';
+            }
+            if (q.feedback) {
+                html += '<div style="font-size:10.5px;color:var(--muted);font-style:italic;margin-top:4px;">💡 '
+                    + escapeHtml(q.feedback) + '</div>';
+            }
+            html += '</div>';
+        });
+        box.innerHTML = html;
+    }
+
+    document.addEventListener('click', function (e) {
+        var row = e.target.closest('[data-er-row]');
+        if (!row) return;
+
+        var detail = row.nextElementSibling;
+        if (!detail || !detail.classList.contains('er-detail')) return;
+
+        var wasOpen = row.classList.contains('expanded');
+
+        document.querySelectorAll('.er-row.expanded').forEach(function (r) {
+            if (r !== row) r.classList.remove('expanded');
+        });
+        document.querySelectorAll('.er-detail.open').forEach(function (d) {
+            if (d !== detail) { d.classList.remove('open'); }
+        });
+
+        if (wasOpen) {
+            row.classList.remove('expanded');
+            detail.classList.remove('open');
+            return;
+        }
+
+        row.classList.add('expanded');
+        detail.classList.add('open');
+
+        var qBox = detail.querySelector('[data-er-questions]');
+        if (!qBox || qBox.dataset.loaded === '1') return;
+
+        qBox.dataset.loaded = '1';
+        qBox.innerHTML = '<div class="er-detail-loading">Loading questions…</div>';
+
+        var source = row.dataset.source;
+        var attemptId = row.dataset.attemptId;
+
+        fetch('my_results_detail.php?source=' + encodeURIComponent(source)
+              + '&attempt_id=' + encodeURIComponent(attemptId),
+              { credentials: 'same-origin' })
+            .then(async function (r) {
+                var text = await r.text();
+                if (!r.ok) {
+                    throw new Error('HTTP ' + r.status + ' — ' + text.slice(0, 300));
+                }
+                try { return JSON.parse(text); }
+                catch (e) { throw new Error('Bad JSON: ' + text.slice(0, 300)); }
+            })
+            .then(function (data) { renderQuestions(qBox, data); })
+            .catch(function (err) {
+                qBox.innerHTML = '<div class="er-detail-loading" style="color:var(--danger);text-align:left;padding:10px;">'
+                    + 'Error: ' + String(err.message).replace(/</g, '&lt;') + '</div>';
+                console.error(err);
+            });
+    });
+
+    /* ---- Subject-wide top scorers ---- */
+    function renderSubjectScorers(box, data) {
+        if (!box) return;
+        if (!data || !data.ok) {
+            box.innerHTML = '<div class="er-detail-loading">'
+                + escapeHtml((data && data.message) || 'Could not load top scorers.')
+                + '</div>';
+            return;
+        }
+        if (!Array.isArray(data.participants) || !data.participants.length) {
+            box.innerHTML = '<div class="er-detail-loading">No submissions yet.</div>';
+            return;
+        }
+        var html = '<div class="er-parts" style="margin-top:0;padding-top:0;border-top:0;">';
+        data.participants.forEach(function (p) {
+            var pts = (p.points != null) ? (p.points | 0) : 0;
+            var bdg = (p.budget != null) ? (p.budget | 0) : 0;
+            var label = bdg > 0 ? (pts + ' / ' + bdg + ' pts') : (pts + ' pts');
+            html += '<div class="er-part ' + (p.is_me ? 'is-me' : '') + '">'
+                + '<div class="er-part-rank">#' + p.rank + '</div>'
+                + '<div class="er-part-name">' + escapeHtml(p.display_name) + '</div>'
+                + '<div class="er-part-score">' + label + '</div>'
+                + '</div>';
+        });
+        html += '</div>';
+        box.innerHTML = html;
+    }
+
+    function toggleSubjectScorers(head) {
+        var panel = head.closest('[data-subject-scorers]');
+        if (!panel) return;
+        var body = panel.querySelector('[data-subject-scorers-body]');
+        var willOpen = !panel.classList.contains('open');
+        panel.classList.toggle('open', willOpen);
+        head.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+        body.style.display = willOpen ? '' : 'none';
+
+        if (!willOpen || body.dataset.loaded === '1') return;
+
+        body.dataset.loaded = '1';
+        body.innerHTML = '<div class="er-detail-loading">Loading top scorers…</div>';
+
+        var sid = panel.dataset.subjectId;
+        var cid = panel.dataset.courseId;
+
+        fetch('my_results_detail.php?source=subject'
+              + '&subject_id=' + encodeURIComponent(sid)
+              + '&course_id='  + encodeURIComponent(cid),
+              { credentials: 'same-origin' })
+            .then(async function (r) {
+                var text = await r.text();
+                if (!r.ok) throw new Error('HTTP ' + r.status + ' — ' + text.slice(0, 300));
+                try { return JSON.parse(text); }
+                catch (e) { throw new Error('Bad JSON: ' + text.slice(0, 300)); }
+            })
+            .then(function (data) { renderSubjectScorers(body, data); })
+            .catch(function (err) {
+                body.innerHTML = '<div class="er-detail-loading" style="color:var(--danger);text-align:left;padding:10px;">'
+                    + 'Error: ' + String(err.message).replace(/</g, '&lt;') + '</div>';
+                console.error(err);
+            });
+    }
+
+    document.addEventListener('click', function (e) {
+        var h = e.target.closest('[data-subject-scorers-toggle]');
+        if (!h) return;
+        toggleSubjectScorers(h);
+    });
+    document.addEventListener('keydown', function (e) {
+        var h = e.target.closest('[data-subject-scorers-toggle]');
+        if (!h) return;
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleSubjectScorers(h); }
+    });
+})();
+</script>
 
 <?php courseShellEnd(); ?>

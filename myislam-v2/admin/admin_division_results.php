@@ -4,6 +4,7 @@ session_start();
 date_default_timezone_set('Africa/Dar_es_Salaam');
 require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/course_helpers.php';
+require_once __DIR__ . '/../includes/course_grades.php';
 
 function e($v): string
 {
@@ -87,6 +88,63 @@ $dEnd = new DateTimeImmutable((string)$division['end_date']);
 $isEnded = $today > $dEnd;
 
 // ============================================================================
+// POINTS MODEL HELPERS — mirror what course.php uses so the preview matches
+// what the student sees on the course page.
+// ============================================================================
+
+if (!function_exists('division_grade_from_percent')) {
+    /** @return array{0:string,1:string,2:bool} [letter, remark, is_pass] */
+    function division_grade_from_percent(float $percent, int $passingScore = 60): array
+    {
+        $p    = max(0.0, min(100.0, $percent));
+        $pass = $p >= $passingScore;
+        if ($pass) {
+            if ($p >= min(100, $passingScore + 20)) return ['A', 'Excellent', true];
+            if ($p >= min(100, $passingScore + 10)) return ['B', 'Very good', true];
+            return ['C', 'Good', true];
+        }
+        if ($p >= max(0, $passingScore - 10)) return ['D', 'Near pass', false];
+        return ['F', 'Fail', false];
+    }
+}
+
+/**
+ * Compute the current points ratio for a subject's grade row, WITHOUT firing
+ * any write. final_score / supplementary_score are stored as POINTS (not %).
+ *
+ * @return array{earned:float, budget:int, percent:float, has_any:bool}
+ */
+function division_subject_points_ratio(?array $gradeRow, array $subjectCfg): array
+{
+    $quiz  = (int)($subjectCfg['quiz_total_points']  ?? 0);
+    $exam  = (int)($subjectCfg['exam_total_points']  ?? 0);
+    $final = (int)($subjectCfg['final_total_points'] ?? 0);
+    $budget = $quiz + $exam + $final;
+
+    if (!$gradeRow) {
+        return ['earned' => 0.0, 'budget' => $budget, 'percent' => 0.0, 'has_any' => false];
+    }
+
+    $weekly  = (float)($gradeRow['weekly_total']  ?? 0);
+    $monthly = (float)($gradeRow['monthly_total'] ?? 0);
+    $finalPts = $gradeRow['final_score'] !== null ? (float)$gradeRow['final_score'] : null;
+    $suppPts  = ((int)($gradeRow['supplementary_attempted'] ?? 0) === 1 && $gradeRow['supplementary_score'] !== null)
+        ? (float)$gradeRow['supplementary_score']
+        : null;
+    $finalSlot = ($finalPts === null && $suppPts === null)
+        ? 0.0
+        : max($finalPts ?? 0.0, $suppPts ?? 0.0);
+
+    $earned = $weekly + $monthly + $finalSlot;
+    $earnedClamped = $budget > 0 ? min($earned, (float)$budget) : 0.0;
+    $percent = $budget > 0 ? round($earnedClamped / $budget * 100, 1) : 0.0;
+
+    $hasAny = $weekly > 0 || $monthly > 0 || $finalPts !== null || $suppPts !== null;
+
+    return ['earned' => $earned, 'budget' => $budget, 'percent' => $percent, 'has_any' => $hasAny];
+}
+
+// ============================================================================
 // POST: Close Division
 // ============================================================================
 
@@ -107,7 +165,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     break;
                 }
 
-                // Check if already closed
+                // Idempotency — bail if already closed
                 $stmt = $conn->prepare("SELECT COUNT(*) FROM enrollment_division_history WHERE division_id = ?");
                 $stmt->execute([$divisionId]);
                 if ((int)$stmt->fetchColumn() > 0) {
@@ -115,7 +173,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     break;
                 }
 
-                // Load subjects of this course with their configs
+                // Load subjects of this course
                 $stmt = $conn->prepare("
                     SELECT cs.*, s.name AS subject_name
                     FROM course_subjects cs
@@ -131,7 +189,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     break;
                 }
 
-                // Load enrollments in this division that are still active
+                // Load active enrollments in this division
                 $stmt = $conn->prepare("
                     SELECT en.id AS enrollment_id, en.user_id
                     FROM course_enrollments en
@@ -147,138 +205,73 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     break;
                 }
 
-                // Grade every student in a transaction
                 $conn->beginTransaction();
 
                 $totalStudents = 0;
                 $totalPassed = 0;
                 $totalFailed = 0;
 
-                $insertHistory = $conn->prepare("
-                    INSERT INTO enrollment_division_history
-                        (enrollment_id, division_id, status, average_grade, courses_passed, courses_failed, completed_at)
-                    VALUES (?, ?, ?, ?, ?, ?, NOW())
+                // Prepare reusable statements
+                $seedRow = $conn->prepare("
+                    INSERT INTO enrollment_course_grades
+                        (enrollment_id, division_id, subject_id)
+                    VALUES (?, ?, ?)
+                    ON DUPLICATE KEY UPDATE enrollment_id = enrollment_id
                 ");
-                $updateEnrollment = $conn->prepare("
+                $forceFinalAttempted = $conn->prepare("
+                    UPDATE enrollment_course_grades
+                    SET final_attempted = 1
+                    WHERE enrollment_id = ? AND division_id = ? AND subject_id = ?
+                      AND final_attempted = 0
+                ");
+                $setDivStatus = $conn->prepare("
                     UPDATE course_enrollments
                     SET division_status = ?
                     WHERE id = ?
                 ");
-                $upsertGrade = $conn->prepare("
-                    INSERT INTO enrollment_course_grades
-                        (enrollment_id, division_id, subject_id, course_grade, status, passed_at, retake_count)
-                    VALUES (?, ?, ?, ?, ?, ?, 0)
-                    ON DUPLICATE KEY UPDATE
-                        course_grade = VALUES(course_grade),
-                        status = VALUES(status),
-                        passed_at = VALUES(passed_at)
-                ");
 
-                foreach ($enrollments as $enr) {
-                    $enrId = (int)$enr['enrollment_id'];
-                    $subjectsPassed = 0;
-                    $subjectsFailed = 0;
-                    $gradeSum = 0.0;
-                    $gradeCount = 0;
+                try {
+                    foreach ($enrollments as $enr) {
+                        $enrId = (int)$enr['enrollment_id'];
 
-                    foreach ($subjects as $sub) {
-                        $sid = (int)$sub['subject_id'];
-
-                        $stmt = $conn->prepare("
-                            SELECT * FROM enrollment_course_grades
-                            WHERE enrollment_id = ? AND division_id = ? AND subject_id = ?
-                            LIMIT 1
-                        ");
-                        $stmt->execute([$enrId, $divisionId, $sid]);
-                        $gradeRow = $stmt->fetch();
-
-                        if (!$gradeRow) {
-                            $gradeRow = [
-                                'weekly_total' => 0, 'weekly_count' => 0,
-                                'monthly_total' => 0, 'monthly_count' => 0,
-                                'final_score' => null, 'supplementary_score' => null,
-                            ];
+                        // ------------------------------------------------------
+                        // For each subject, ensure the grade row exists and force
+                        // a decision through the canonical points-based helper.
+                        //
+                        // academyComputeSubjectGrade() bails with status
+                        // 'in_progress' when final_attempted = 0. When an admin
+                        // closes a division manually, they are declaring the
+                        // division "done" — so we flip final_attempted = 1 first,
+                        // which lets the helper compute (earned / budget) × 100
+                        // and set the final status. Missing quiz/exam points stay
+                        // 0; the student simply loses those points.
+                        // ------------------------------------------------------
+                        foreach ($subjects as $sub) {
+                            $sid = (int)$sub['subject_id'];
+                            $seedRow->execute([$enrId, $divisionId, $sid]);
+                            $forceFinalAttempted->execute([$enrId, $divisionId, $sid]);
+                            academyComputeSubjectGrade($conn, $enrId, $divisionId, $sid);
                         }
 
-                        $finalGrade = courseComputeGrade($gradeRow, $sub);
-                        if ($finalGrade === null) {
-                            $finalGrade = 0.0;
-                        }
+                        // ------------------------------------------------------
+                        // academyCheckDivisionPass() recomputes the average,
+                        // writes enrollment_division_history, and fires the
+                        // division + course certificates when warranted.
+                        // ------------------------------------------------------
+                        $divPassed = academyCheckDivisionPass($conn, $enrId, $divisionId);
 
-                        $passingScore = (int)$sub['passing_score'];
-                        $passed = $finalGrade >= $passingScore;
+                        $setDivStatus->execute([$divPassed ? 'passed' : 'failed', $enrId]);
 
-                        $upsertGrade->execute([
-                            $enrId,
-                            $divisionId,
-                            $sid,
-                            $finalGrade,
-                            $passed ? 'passed' : 'failed',
-                            $passed ? date('Y-m-d H:i:s') : null,
-                        ]);
-
-                        if ($passed) {
-                            $subjectsPassed++;
-                        } else {
-                            $subjectsFailed++;
-                        }
-                        $gradeSum += $finalGrade;
-                        $gradeCount++;
+                        $totalStudents++;
+                        if ($divPassed) $totalPassed++; else $totalFailed++;
                     }
 
-                    $avgGrade = $gradeCount > 0 ? round($gradeSum / $gradeCount, 2) : 0;
-                    $allPassed = ($subjectsFailed === 0);
-
-                    $insertHistory->execute([
-                        $enrId,
-                        $divisionId,
-                        $allPassed ? 'passed' : 'failed',
-                        $avgGrade,
-                        $subjectsPassed,
-                        $subjectsFailed,
-                    ]);
-
-                                    $updateEnrollment->execute([
-                        $allPassed ? 'passed' : 'failed',
-                        $enrId,
-                    ]);
-
-                    // ---- Check whether the WHOLE COURSE is now complete ----
-                    if ($allPassed) {
-                        // Are all divisions of this course closed AND passed for this enrollment?
-                        $stmt = $conn->prepare("
-                            SELECT
-                              (SELECT COUNT(*) FROM course_divisions WHERE course_id = ?) AS total_divisions,
-                              (SELECT COUNT(*) FROM enrollment_division_history h
-                                 WHERE h.enrollment_id = ? AND h.status = 'passed'
-                              ) AS passed_divisions
-                        ");
-                        $stmt->execute([$courseId, $enrId]);
-                        $stats = $stmt->fetch();
-
-                        $totalDivs = (int)($stats['total_divisions'] ?? 0);
-                        $passedDivs = (int)($stats['passed_divisions'] ?? 0);
-
-                        if ($totalDivs > 0 && $passedDivs >= $totalDivs) {
-                            // The student has now passed every division.
-                            $conn->prepare("
-                                UPDATE course_enrollments
-                                SET status = 'completed',
-                                    division_status = 'completed',
-                                    completed_at = NOW()
-                                WHERE id = ?
-                            ")->execute([$enrId]);
-                        }
-                    }
-                    // --------------------------------------------------------
-
-                    $totalStudents++;
-                    if ($allPassed) $totalPassed++; else $totalFailed++;
+                    $conn->commit();
+                    flash('success', "Division closed. $totalStudents students graded · $totalPassed passed · $totalFailed failed.");
+                } catch (Throwable $innerEx) {
+                    if ($conn->inTransaction()) $conn->rollBack();
+                    throw $innerEx;
                 }
-
-                $conn->commit();
-
-                flash('success', "Division closed. $totalStudents students graded · $totalPassed passed · $totalFailed failed.");
                 break;
             }
 
@@ -308,7 +301,7 @@ $stmt = $conn->prepare("SELECT COUNT(*) FROM enrollment_division_history WHERE d
 $stmt->execute([$divisionId]);
 $isClosed = (int)$stmt->fetchColumn() > 0;
 
-// Enrolled students in this division (active only for grading)
+// Active students in this division
 $stmt = $conn->prepare("
     SELECT en.id AS enrollment_id, en.status AS enrollment_status, en.division_status,
            u.id AS user_id, u.username, u.email, u.full_name
@@ -440,6 +433,19 @@ foreach ($stmt->fetchAll() as $r) {
         table.data td.grade.pass { color: var(--success); }
         table.data td.grade.fail { color: var(--danger); }
         table.data td.grade.pending { color: var(--muted); }
+        table.data td.grade .lt {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 20px; height: 20px; border-radius: 50%;
+            font-size: 10px; font-weight: 800; color: #fff; margin-left: 4px;
+        }
+        table.data td.grade .lt.A { background: #15803d; }
+        table.data td.grade .lt.B { background: var(--accent); }
+        table.data td.grade .lt.C { background: var(--gold); }
+        table.data td.grade .lt.D { background: #c2410c; }
+        table.data td.grade .lt.F { background: var(--danger); }
+        table.data td.grade .lt.none { background: transparent; color: var(--muted); }
         .empty { text-align: center; color: var(--muted); padding: 26px 12px; }
 
         .close-banner {
@@ -497,13 +503,14 @@ foreach ($stmt->fetchAll() as $r) {
                         Closing will:
                     </p>
                     <ul style="margin:6px 0 0 20px;font-size:13px;color:var(--text-secondary);">
-                        <li>Compute each student's final grade using the weighted formula</li>
+                        <li>Compute each subject's grade as <strong>(points earned) ÷ (subject total mark) × 100</strong>, capped at 100</li>
                         <li>Mark each subject as <strong>passed</strong> or <strong>failed</strong> (≥ <?php echo (int)$division['passing_score']; ?>%)</li>
                         <li>Mark each student as passing or failing the whole division</li>
-                        <li>Log the result permanently</li>
+                        <li>Fire division and course certificates where applicable</li>
                     </ul>
                     <p style="margin-top:8px;font-size:12px;color:var(--danger);">
                         <strong>This cannot be undone.</strong>
+                        Any subject without attempts will be treated as having earned 0 points — the student loses those points.
                     </p>
                     <?php if (!$isEnded): ?>
                         <p style="margin-top:8px;font-size:13px;color:var(--muted);">
@@ -533,7 +540,7 @@ foreach ($stmt->fetchAll() as $r) {
     <!-- Results table -->
     <section class="card">
         <h2>
-            <span><?php echo $isClosed ? 'Final grades' : 'Pre-grade preview'; ?></span>
+            <span><?php echo $isClosed ? 'Final grades' : 'Points preview'; ?></span>
             <span class="badge brand"><?php echo count($enrolledStudents); ?> students</span>
         </h2>
 
@@ -545,8 +552,18 @@ foreach ($stmt->fetchAll() as $r) {
                     <thead>
                         <tr>
                             <th>Student</th>
-                            <?php foreach ($courseSubjects as $sub): ?>
-                                <th><?php echo e($sub['subject_name']); ?><br><small style="font-weight:500;">≥ <?php echo (int)$sub['passing_score']; ?>%</small></th>
+                            <?php foreach ($courseSubjects as $sub):
+                                $subjTotal = (int)$sub['quiz_total_points']
+                                           + (int)$sub['exam_total_points']
+                                           + (int)$sub['final_total_points'];
+                            ?>
+                                <th>
+                                    <?php echo e($sub['subject_name']); ?>
+                                    <br><small style="font-weight:500;">
+                                        ≥ <?php echo (int)$sub['passing_score']; ?>% ·
+                                        <?php echo (int)$subjTotal; ?> pts
+                                    </small>
+                                </th>
                             <?php endforeach; ?>
                             <th>Average</th>
                             <th>Overall</th>
@@ -568,33 +585,54 @@ foreach ($stmt->fetchAll() as $r) {
                             <?php foreach ($courseSubjects as $sub):
                                 $sid = (int)$sub['subject_id'];
                                 $row = $gradeMap[$enrId][$sid] ?? null;
-                                $grade = null;
-                                if ($row) {
-                                    if ($isClosed) {
-                                        $grade = $row['course_grade'] !== null ? (float)$row['course_grade'] : null;
-                                    } else {
-                                        $grade = courseComputeProjectedGrade($row, $sub);
-                                    }
+
+                                // When the division is closed, read the stored course_grade.
+                                // Before closing, compute the SAME points ratio that
+                                // course.php displays so the preview matches exactly.
+                                if ($isClosed) {
+                                    $grade = ($row && $row['course_grade'] !== null)
+                                        ? (float)$row['course_grade']
+                                        : null;
+                                    $hasAny = $grade !== null;
+                                } else {
+                                    $ratio = division_subject_points_ratio($row, $sub);
+                                    $grade  = $ratio['has_any'] ? $ratio['percent'] : null;
+                                    $hasAny = $ratio['has_any'];
                                 }
+
                                 $passing = (int)$sub['passing_score'];
+                                [$letter, $remark, $letterPass] = division_grade_from_percent(
+                                    $grade ?? 0.0,
+                                    $passing
+                                );
+
                                 if ($grade === null) {
                                     $cls = 'pending';
                                     $label = '—';
-                                } elseif ($grade >= $passing) {
-                                    $cls = 'pass';
-                                    $label = (int)round($grade) . '%';
-                                    if ($isClosed) $subjectsPassed++;
+                                    $letterShow = '';
                                 } else {
-                                    $cls = 'fail';
+                                    if ($grade >= $passing) {
+                                        $cls = 'pass';
+                                        if ($isClosed) $subjectsPassed++;
+                                    } else {
+                                        $cls = 'fail';
+                                        if ($isClosed) $subjectsFailed++;
+                                    }
                                     $label = (int)round($grade) . '%';
-                                    if ($isClosed) $subjectsFailed++;
+                                    $letterShow = $letter;
                                 }
+
                                 if ($grade !== null) {
                                     $gradeSum += $grade;
                                     $gradeCount++;
                                 }
                             ?>
-                                <td class="grade <?php echo $cls; ?>"><?php echo e($label); ?></td>
+                                <td class="grade <?php echo $cls; ?>">
+                                    <?php echo e($label); ?>
+                                    <?php if ($letterShow !== ''): ?>
+                                        <span class="lt <?php echo e($letterShow); ?>" title="<?php echo e($remark); ?>"><?php echo e($letterShow); ?></span>
+                                    <?php endif; ?>
+                                </td>
                             <?php endforeach; ?>
                             <td><strong><?php echo $gradeCount > 0 ? (int)round($gradeSum / $gradeCount) . '%' : '—'; ?></strong></td>
                             <td>
@@ -613,10 +651,10 @@ foreach ($stmt->fetchAll() as $r) {
             </div>
             <p style="margin-top:12px;font-size:12px;color:var(--muted);">
                 <?php if ($isClosed): ?>
-                    Final grades shown. A student passes a subject if their weighted grade ≥ the subject's passmark.
+                    Final grades shown. A student passes a subject if their grade (points earned ÷ subject total mark × 100) ≥ the subject's passmark.
                 <?php else: ?>
-                    Preview using the <strong>projected grade</strong> (assumes the student scores their current average on the final exam).
-                    Real grades will be computed when you close the division.
+                    Preview using the <strong>live points ratio</strong> — the exact same formula the student sees on their course page.
+                    Missing quiz/exam points stay 0; the final computation happens when you close the division.
                 <?php endif; ?>
             </p>
         <?php endif; ?>

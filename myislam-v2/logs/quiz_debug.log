@@ -205,3 +205,11 @@
 [2026-10-18 06:31:04] Grading: 5/5 (100%) - Passed: Yes
 [2026-10-18 06:31:04] Attempt saved successfully. ID: 3, attempt_number: 2
 [2026-10-18 06:31:04] Academy grade sync OK: {"ok":true,"grade":null,"status":"in_progress","division_passed":false,"course_passed":false}
+[2026-10-21 18:54:01] Submission started - User: 12, Quiz: 1012, Mode: competition, Attempt: 305, Auto: Yes
+[2026-10-21 18:54:01] Attempt scope resolved: course_id=1, enrollment_id=1, division_id=2
+[2026-10-21 18:54:01] Q1034 | submitted: 1101 | available: 1100,1101,1102
+[2026-10-21 18:54:01] Q1035 | submitted: 1104 | available: 1103,1104,1105
+[2026-10-21 18:54:01] Q1036 | submitted: 1107 | available: 1106,1107,1108
+[2026-10-21 18:54:01] Grading: 0/15 (0%) - Passed: No
+[2026-10-21 18:54:01] Attempt saved successfully. ID: 305, attempt_number: 2, course_id=1, enrollment_id=1
+[2026-10-21 18:54:01] Academy grade sync OK: {"ok":true,"grade":null,"status":"in_progress","division_passed":false,"course_passed":false}

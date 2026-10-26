@@ -280,7 +280,6 @@ function handleCourseCover(?string $existingPath, bool $clearImage, ?string &$er
 {
     $error = null;
 
-    // Clear requested
     if ($clearImage) {
         if (!empty($existingPath)) {
             $abs = __DIR__ . '/../' . ltrim($existingPath, '/');
@@ -289,7 +288,6 @@ function handleCourseCover(?string $existingPath, bool $clearImage, ?string &$er
         return null;
     }
 
-    // No new upload — keep existing
     if (empty($_FILES['cover_file']['tmp_name']) || !is_uploaded_file($_FILES['cover_file']['tmp_name'])) {
         return $existingPath;
     }
@@ -301,7 +299,7 @@ function handleCourseCover(?string $existingPath, bool $clearImage, ?string &$er
         return $existingPath;
     }
 
-    $maxBytes = 4 * 1024 * 1024; // 4 MB
+    $maxBytes = 4 * 1024 * 1024;
     if ((int)$f['size'] > $maxBytes) {
         $error = 'Cover image must be 4 MB or smaller.';
         return $existingPath;
@@ -334,7 +332,6 @@ function handleCourseCover(?string $existingPath, bool $clearImage, ?string &$er
         return $existingPath;
     }
 
-    // Delete old file if present
     if (!empty($existingPath)) {
         $old = __DIR__ . '/../' . ltrim($existingPath, '/');
         if (str_starts_with($old, $uploadsRoot) && is_file($old)) {
@@ -343,6 +340,48 @@ function handleCourseCover(?string $existingPath, bool $clearImage, ?string &$er
     }
 
     return COURSE_UPLOAD_DIR . $fname;
+}
+
+/**
+ * Sum points of every scheduled item for a subject, grouped by bucket.
+ * Mirrors what course.php / admin_course_schedule.php use to validate budgets.
+ *
+ * @return array{quiz:int, exam:int, quiz_count:int, exam_count:int}
+ */
+function getScheduledPointsByBucket(PDO $conn, int $courseId, int $subjectId): array
+{
+    $out = ['quiz' => 0, 'exam' => 0, 'quiz_count' => 0, 'exam_count' => 0];
+    try {
+        $stmt = $conn->prepare("
+            SELECT cs.item_type,
+                   COUNT(*) AS cnt,
+                   COALESCE(SUM(
+                       CASE cs.item_type
+                           WHEN 'quiz' THEN (SELECT total_points FROM quizzes WHERE id = cs.item_id)
+                           WHEN 'exam' THEN (SELECT total_points FROM monthly_exams WHERE id = cs.item_id)
+                           ELSE 0
+                       END
+                   ), 0) AS pts
+            FROM course_schedule cs
+            WHERE cs.course_id = ? AND cs.subject_id = ?
+              AND cs.item_type IN ('quiz','exam')
+            GROUP BY cs.item_type
+        ");
+        $stmt->execute([$courseId, $subjectId]);
+        foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $r) {
+            $t = (string)$r['item_type'];
+            if ($t === 'quiz') {
+                $out['quiz'] += (int)$r['pts'];
+                $out['quiz_count'] += (int)$r['cnt'];
+            } elseif ($t === 'exam') {
+                $out['exam'] += (int)$r['pts'];
+                $out['exam_count'] += (int)$r['cnt'];
+            }
+        }
+    } catch (PDOException $e) {
+        error_log('getScheduledPointsByBucket: ' . $e->getMessage());
+    }
+    return $out;
 }
 
 // ============================================================================
@@ -392,10 +431,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 // Load existing image (for edit mode)
                 $existingCover = null;
+                $oldDivisionType = null;
                 if ($id > 0) {
-                    $stmt = $conn->prepare("SELECT image_path FROM courses WHERE id = ?");
+                    $stmt = $conn->prepare("SELECT image_path, division_type FROM courses WHERE id = ?");
                     $stmt->execute([$id]);
-                    $existingCover = $stmt->fetchColumn() ?: null;
+                    $existingRow = $stmt->fetch(PDO::FETCH_ASSOC);
+                    $existingCover = $existingRow ? ($existingRow['image_path'] ?: null) : null;
+                    $oldDivisionType = $existingRow ? (string)$existingRow['division_type'] : null;
                 }
 
                 $uploadError = null;
@@ -409,8 +451,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $stmt = $conn->prepare("SELECT COUNT(*) FROM course_divisions WHERE course_id = ?");
                     $stmt->execute([$id]);
                     $existingDivisions = (int)$stmt->fetchColumn();
+
                     if ($existingDivisions > 0 && $divisionType === 'none') {
                         flash('error', "This course already has $existingDivisions divisions. Delete them first if you want to remove divisions.");
+                        break;
+                    }
+
+                    // Prevent division-type change while divisions exist —
+                    // otherwise existing division names/labels would become
+                    // misleading (e.g. "Semester 1" but type is now "weeks").
+                    if ($existingDivisions > 0 && $oldDivisionType !== null
+                        && $divisionType !== $oldDivisionType) {
+                        flash('error',
+                            'Cannot change division type while this course has existing divisions. '
+                            . 'Delete the divisions first if you want to switch to '
+                            . $divisionType . '.');
                         break;
                     }
 
@@ -466,7 +521,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     break;
                 }
 
-                // Delete cover file
                 $stmt = $conn->prepare("SELECT image_path FROM courses WHERE id = ?");
                 $stmt->execute([$id]);
                 $oldCover = $stmt->fetchColumn() ?: null;
@@ -716,6 +770,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     break;
                 }
 
+                // If we're shrinking the budget, warn (but don't block) when
+                // it's below the points already scheduled for this subject.
+                // The schedule enforcement layer prevents adding more; but the
+                // admin may legitimately want to reduce a budget for future
+                // subjects — so we only alert.
+                $scheduled = getScheduledPointsByBucket($conn, $courseIdPost, $subjectId);
+                $warnings = [];
+                if ($scheduled['quiz'] > $quizTotal) {
+                    $warnings[] = 'weekly budget (' . $quizTotal . ' pts) is below already-scheduled quizzes ('
+                        . $scheduled['quiz'] . ' pts)';
+                }
+                if ($scheduled['exam'] > $examTotal) {
+                    $warnings[] = 'monthly budget (' . $examTotal . ' pts) is below already-scheduled exams ('
+                        . $scheduled['exam'] . ' pts)';
+                }
+
                 $stmt = $conn->prepare("
                     UPDATE course_subjects
                     SET passing_score           = ?,
@@ -735,7 +805,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $sms,
                     $courseIdPost, $subjectId
                 ]);
-                flash('success', 'Grading configuration saved.');
+
+                if ($warnings) {
+                    flash('error', 'Grading saved, but notice: ' . implode('; ', $warnings) . '.');
+                } else {
+                    flash('success', 'Grading configuration saved.');
+                }
                 break;
             }
 
@@ -882,6 +957,7 @@ $enrolledStudents = [];
 $divisions = [];
 $courseSubjects = [];
 $allSubjects = [];
+$scheduledUsage = []; // [subject_id] => ['quiz'=>pts,'exam'=>pts,'quiz_count'=>n,'exam_count'=>n]
 
 if (!$course) {
     $courses = $conn->query("
@@ -906,6 +982,15 @@ if (!$course) {
     ");
     $stmt->execute([$courseId]);
     $courseSubjects = $stmt->fetchAll();
+
+    // Scheduled points per subject — for the live "used / budget" badge
+    foreach ($courseSubjects as $cs) {
+        $scheduledUsage[(int)$cs['subject_id']] = getScheduledPointsByBucket(
+            $conn,
+            $courseId,
+            (int)$cs['subject_id']
+        );
+    }
 
     $allSubjects = $conn->query("
         SELECT id, name, slug, icon
@@ -1076,7 +1161,6 @@ $jsonFlags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_
         }
         textarea { min-height: 84px; resize: vertical; }
 
-        /* Cover image uploader */
         .cover-uploader {
             display: flex; gap: 14px; align-items: flex-start;
             padding: 12px; background: var(--surface-2); border-radius: var(--radius-md);
@@ -1104,7 +1188,6 @@ $jsonFlags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_
         }
         .cover-clear-btn:hover { border-color: var(--danger); }
 
-        /* Divisions editor */
         .div-table { min-width: 900px; }
         .div-table th, .div-table td { padding: 8px 10px; }
         .div-table input[type="text"],
@@ -1115,7 +1198,6 @@ $jsonFlags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_
         .div-table .actions-cell { text-align: right; }
         .div-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; flex-wrap: wrap; }
 
-        /* Subject config card */
         .subject-config {
             border: 1px solid var(--line); border-radius: var(--radius-md);
             padding: 14px; background: var(--surface-2);
@@ -1125,7 +1207,7 @@ $jsonFlags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_
             gap: 10px; flex-wrap: wrap; margin-bottom: 12px;
         }
         .subject-config-header .name-wrap {
-            display: flex; align-items: center; gap: 10px;
+            display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
         }
         .subject-config-header .name {
             font-size: 16px; font-weight: 800; color: var(--brand);
@@ -1133,6 +1215,20 @@ $jsonFlags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_
         .subject-config-grid {
             grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
         }
+        .usage-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 3px 10px;
+            border-radius: 999px;
+            font-size: 11px;
+            font-weight: 700;
+            white-space: nowrap;
+        }
+        .usage-badge.ok      { background: var(--success-soft); color: var(--success); }
+        .usage-badge.warn    { background: var(--gold-soft);    color: var(--gold); }
+        .usage-badge.over    { background: var(--danger-soft);  color: var(--danger); }
+        .usage-badge.muted   { background: var(--surface-3);    color: var(--muted); }
 
         .div-chip { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px; background: var(--brand-soft); border: 1px solid var(--brand); color: var(--brand); font-weight: 700; font-size: 12px; }
 
@@ -1264,7 +1360,6 @@ $jsonFlags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_
             </span>
         </h2>
 
-        <!-- Preview card if cover exists -->
         <?php if ($currentCoverOk): ?>
             <div style="display:flex;gap:16px;align-items:center;margin-bottom:16px;padding:12px;background:var(--surface-2);border-radius:var(--radius-md);border:1px solid var(--line);">
                 <div style="width:100px;height:100px;border-radius:10px;overflow:hidden;flex-shrink:0;border:1px solid var(--line);">
@@ -1487,6 +1582,28 @@ $jsonFlags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_
                         'final_exam_count'        => (int)($cs['final_exam_count']        ?? 1),
                     ];
                     $pointsBudget = $cfg['quiz_total_points'] + $cfg['exam_total_points'] + $cfg['final_total_points'];
+
+                    // Scheduled vs. budget status
+                    $usage = $scheduledUsage[$sid] ?? ['quiz' => 0, 'exam' => 0, 'quiz_count' => 0, 'exam_count' => 0];
+                    $quizUsed = (int)$usage['quiz'];
+                    $examUsed = (int)$usage['exam'];
+
+                    // Determine the badge
+                    $usageClass = 'ok';
+                    $usageTitle = 'All scheduled items fit within budget';
+                    if ($quizUsed > $cfg['quiz_total_points'] || $examUsed > $cfg['exam_total_points']) {
+                        $usageClass = 'over';
+                        $usageTitle = 'Scheduled items exceed the current budget — reduce them or raise the budget';
+                    } elseif (
+                        ($cfg['quiz_total_points'] > 0 && $quizUsed === $cfg['quiz_total_points']) ||
+                        ($cfg['exam_total_points'] > 0 && $examUsed === $cfg['exam_total_points'])
+                    ) {
+                        $usageClass = 'warn';
+                        $usageTitle = 'Scheduled items use the full budget — no more room in that bucket';
+                    } elseif ($quizUsed === 0 && $examUsed === 0) {
+                        $usageClass = 'muted';
+                        $usageTitle = 'Nothing scheduled yet in this subject';
+                    }
                 ?>
                     <form method="post" class="subject-config" data-subject-form>
                         <?php echo csrfField(); ?>
@@ -1500,6 +1617,10 @@ $jsonFlags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_
                                 <span class="name"><?php echo e($cs['name']); ?></span>
                                 <span class="badge <?php echo $pointsBudget >= 1 ? 'success' : 'danger'; ?>" data-points-badge>
                                     budget: <?php echo $pointsBudget; ?> pts
+                                </span>
+                                <span class="usage-badge <?php echo $usageClass; ?>" title="<?php echo e($usageTitle); ?>">
+                                    📅 <?php echo $quizUsed; ?>/<?php echo $cfg['quiz_total_points']; ?> quiz
+                                    · <?php echo $examUsed; ?>/<?php echo $cfg['exam_total_points']; ?> exam
                                 </span>
                             </div>
                             <div>
@@ -1777,7 +1898,6 @@ $jsonFlags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_
                     <textarea id="courseDescription" name="description"></textarea>
                 </div>
 
-                <!-- Cover image uploader -->
                 <div class="field wide">
                     <label>Cover image</label>
                     <div class="cover-uploader">
@@ -1809,7 +1929,7 @@ $jsonFlags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_
                         <option value="years">By years</option>
                         <option value="custom">Custom divisions</option>
                     </select>
-                    <small>Divisions are the blocks a student progresses through.</small>
+                    <small id="divisionTypeHint">Divisions are the blocks a student progresses through.</small>
                 </div>
                 <div class="field" id="divisionLabelField">
                     <label for="courseDivisionLabel">What do you call each division?</label>
@@ -1861,11 +1981,12 @@ $jsonFlags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_
         d.addEventListener('click', e => { if (e.target === d) d.close(); });
     });
 
-    // ---- Course dialog: division label toggle + cover upload ----
+    // ---- Course dialog ----
     const courseDialog = document.getElementById('courseDialog');
     const divisionTypeSel = document.getElementById('courseDivisionType');
     const divisionLabelField = document.getElementById('divisionLabelField');
     const divisionLabelInput = document.getElementById('courseDivisionLabel');
+    const divisionTypeHint = document.getElementById('divisionTypeHint');
 
     const coverInput = document.getElementById('coverFileInput');
     const coverPreview = document.getElementById('coverPreview');
@@ -1880,6 +2001,7 @@ $jsonFlags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_
     };
 
     let currentCoverUrl = '';
+    let currentDivisionType = null;
 
     function syncDivisionLabel() {
         const type = divisionTypeSel.value;
@@ -1891,8 +2013,20 @@ $jsonFlags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_
                 divisionLabelInput.value = DEFAULT_LABELS[type] || '';
             }
         }
+
+        // Warn when the admin tries to change type while divisions exist.
+        if (currentDivisionType !== null && currentDivisionType !== type && divisionsExist) {
+            divisionTypeHint.textContent = '⚠️ This course already has divisions — the type cannot be changed.';
+            divisionTypeHint.style.color = 'var(--danger)';
+            divisionTypeSel.value = currentDivisionType;
+        } else {
+            divisionTypeHint.textContent = 'Divisions are the blocks a student progresses through.';
+            divisionTypeHint.style.color = '';
+        }
     }
     divisionTypeSel.addEventListener('change', syncDivisionLabel);
+
+    let divisionsExist = <?php echo $course && count($divisions) > 0 ? 'true' : 'false'; ?>;
 
     function setCoverPreviewFromUrl(url) {
         currentCoverUrl = url || '';
@@ -1911,7 +2045,6 @@ $jsonFlags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_
     coverInput.addEventListener('change', () => {
         const f = coverInput.files && coverInput.files[0];
         if (!f) {
-            // Revert preview
             setCoverPreviewFromUrl(currentCoverUrl);
             return;
         }
@@ -1959,6 +2092,7 @@ $jsonFlags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_
                 document.getElementById('courseDivisionLabel').value = current.division_label;
                 document.getElementById('courseStatus').value = current.status;
                 setCoverPreviewFromUrl(current.cover_url);
+                currentDivisionType = current.division_type;
             } else {
                 document.getElementById('courseIdField').value = '0';
                 document.getElementById('courseTitle').value = '';
@@ -1967,6 +2101,7 @@ $jsonFlags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_
                 document.getElementById('courseDivisionLabel').value = '';
                 document.getElementById('courseStatus').value = 'draft';
                 setCoverPreviewFromUrl('');
+                currentDivisionType = null;
             }
             <?php else: ?>
             document.getElementById('courseIdField').value = '0';
@@ -1976,14 +2111,13 @@ $jsonFlags = JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT | JSON_
             document.getElementById('courseDivisionLabel').value = '';
             document.getElementById('courseStatus').value = 'draft';
             setCoverPreviewFromUrl('');
+            currentDivisionType = null;
             <?php endif; ?>
 
             syncDivisionLabel();
             courseDialog.showModal();
         });
     });
-
-    syncDivisionLabel();
 
     <?php if ($course && $divisionType !== 'none'): ?>
     // ---- Division: live weeks computation ----

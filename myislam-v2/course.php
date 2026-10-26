@@ -28,7 +28,6 @@ if ($courseId <= 0 || !courseTablesExist($conn)) {
 // Load enrollment
 // ----------------------------------------------------------------------------
 $en = courseLoadEnrollment($conn, $userId, $courseId);
-// Fetch the course cover image (if courseLoadEnrollment doesn't already)
 $courseImagePath = null;
 try {
     $stmt = $conn->prepare("SELECT image_path FROM courses WHERE id = ? LIMIT 1");
@@ -51,20 +50,103 @@ if ($advanced) {
     }
 }
 
+// ============================================================================
+// ISSUE 4 — Auto-calculate final division status when a division's end_date
+// has passed. Idempotent: only runs if the division is still pending/in_progress
+// and end_date is in the past. Computes pass/fail even with zero attempts.
+// ============================================================================
+try {
+    $pastDivStmt = $conn->prepare("
+        SELECT cd.id AS division_id, cd.end_date, cd.passing_score,
+               en.id AS enrollment_id, en.division_status
+        FROM course_enrollments en
+        JOIN course_divisions cd ON cd.id = en.current_division_id
+        WHERE en.id = ?
+          AND cd.end_date < CURDATE()
+          AND en.status = 'active'
+          AND en.division_status IN ('pending','in_progress')
+        LIMIT 1
+    ");
+    $pastDivStmt->execute([(int)$en['id']]);
+    $endedDiv = $pastDivStmt->fetch(PDO::FETCH_ASSOC);
+
+    if ($endedDiv) {
+        $divId     = (int)$endedDiv['division_id'];
+        $enrId     = (int)$endedDiv['enrollment_id'];
+        $passScore = (int)$endedDiv['passing_score'];
+
+        // POINTS model: course_grade = weekly + monthly + best(final, supplementary), out of the
+        // subject's total mark. A subject passes when its points reach the subject pass mark.
+        // Every subject of the course counts, even one with no grade row yet (it counts as not passed).
+        $aggStmt = $conn->prepare("
+            SELECT
+                COUNT(*)                                                           AS total_subjects,
+                SUM(CASE WHEN g.course_grade IS NOT NULL
+                          AND g.course_grade >= cs.passing_score THEN 1 ELSE 0 END) AS passed_subjects,
+                AVG(COALESCE(g.course_grade, 0))                                   AS avg_grade
+            FROM course_subjects cs
+            LEFT JOIN enrollment_course_grades g
+                   ON g.subject_id    = cs.subject_id
+                  AND g.enrollment_id = ?
+                  AND g.division_id   = ?
+            WHERE cs.course_id = ?
+        ");
+        $aggStmt->execute([$enrId, $divId, $courseId]);
+        $agg = $aggStmt->fetch(PDO::FETCH_ASSOC)
+            ?: ['total_subjects' => 0, 'passed_subjects' => 0, 'avg_grade' => 0];
+
+        $totalSubjects  = (int)$agg['total_subjects'];
+        $passedSubjects = (int)$agg['passed_subjects'];
+        $avgGrade       = (float)$agg['avg_grade'];
+
+        // Passes only if at least one subject exists and every subject passes.
+        $divisionStatus = ($totalSubjects > 0 && $passedSubjects === $totalSubjects)
+            ? 'passed' : 'failed';
+
+        $conn->prepare("UPDATE course_enrollments SET division_status = ? WHERE id = ?")
+             ->execute([$divisionStatus, $enrId]);
+
+        try {
+            $conn->prepare("
+                INSERT INTO enrollment_division_history
+                    (enrollment_id, division_id, status, average_grade,
+                     courses_passed, courses_failed, completed_at)
+                VALUES (?, ?, ?, ?, ?, ?, NOW())
+                ON DUPLICATE KEY UPDATE
+                    status         = VALUES(status),
+                    average_grade  = VALUES(average_grade),
+                    courses_passed = VALUES(courses_passed),
+                    courses_failed = VALUES(courses_failed)
+            ")->execute([
+                $enrId, $divId, $divisionStatus,
+                $avgGrade, $passedSubjects, max(0, $totalSubjects - $passedSubjects),
+            ]);
+        } catch (PDOException $histErr) {
+            error_log('course.php history upsert: ' . $histErr->getMessage());
+        }
+
+        // Reload to reflect new status
+        $en = courseLoadEnrollment($conn, $userId, $courseId);
+        if (!$en) courseRedirect('courses.php');
+    }
+} catch (PDOException $e) {
+    error_log('course.php auto-end check: ' . $e->getMessage());
+}
+
 // ----------------------------------------------------------------------------
 // Basics
 // ----------------------------------------------------------------------------
-$divisionType = (string)($en['division_type'] ?? 'none');
+$divisionType  = (string)($en['division_type'] ?? 'none');
 $divisionLabel = (string)($en['division_label'] ?? 'Division');
 
 $curDiv = null;
 if (!empty($en['current_div_id'])) {
     $curDiv = [
-        'id' => (int)$en['current_div_id'],
-        'number' => (int)$en['current_div_number'],
-        'name' => (string)$en['current_div_name'],
-        'start_date' => (string)$en['current_div_start'],
-        'end_date' => (string)$en['current_div_end'],
+        'id'            => (int)$en['current_div_id'],
+        'number'        => (int)$en['current_div_number'],
+        'name'          => (string)$en['current_div_name'],
+        'start_date'    => (string)$en['current_div_start'],
+        'end_date'      => (string)$en['current_div_end'],
         'passing_score' => (int)$en['current_div_passing'],
     ];
 }
@@ -112,10 +194,6 @@ if ($curDiv) {
 
 // ----------------------------------------------------------------------------
 // Pre-load available semester exams
-//
-// Scoped to this course explicitly so that if two courses ever share a
-// division (Option A normally prevents this), the current course's exams
-// still win. The additional AND cs.course_id = ? keeps the query defensive.
 // ----------------------------------------------------------------------------
 $examsBySubject = ['final' => [], 'supplementary' => []];
 if ($curDiv) {
@@ -135,8 +213,8 @@ if ($curDiv) {
         $eStmt->execute([$curDiv['id'], $courseId]);
         foreach ($eStmt->fetchAll(PDO::FETCH_ASSOC) as $ex) {
             $examsBySubject[$ex['exam_type']][(int)$ex['subject_id']] = [
-                'id' => (int)$ex['id'],
-                'title' => (string)$ex['title'],
+                'id'            => (int)$ex['id'],
+                'title'         => (string)$ex['title'],
                 'passing_score' => (int)$ex['passing_score'],
             ];
         }
@@ -145,82 +223,104 @@ if ($curDiv) {
     }
 }
 
-// ----------------------------------------------------------------------------
-// Letter grade + remark   A 80-100 · B 70-79 · C 60-69 · D 50-59 · below 50 = F
-// ----------------------------------------------------------------------------
-if (!function_exists('zadLetterGrade')) {
-    /** @return array{0:string,1:string} [letter, remark] */
-    function zadLetterGrade(float $percent): array
+// ============================================================================
+// Letter grade — ONE source of truth, fixed bands on the share of the subject's points:
+//     A 80-100 Excellent · B 70-79 Very good · C 60-69 Good · D 50-59 Pass · F below 50 Fail
+// "Pass" itself is decided by the subject's pass mark (course_subjects.passing_score), not by the letter.
+// ============================================================================
+if (!function_exists('zadGradeFromPercent')) {
+    /**
+     * @return array{0:string,1:string,2:bool} [letter, remark, reaches_pass_mark]
+     */
+    function zadGradeFromPercent(float $percent, int $passingScore = 50): array
     {
-        if ($percent >= 80) return ['A', 'Excellent'];
-        if ($percent >= 70) return ['B', 'Very good'];
-        if ($percent >= 60) return ['C', 'Good'];
-        if ($percent >= 50) return ['D', 'Pass'];
-        return ['F', 'Fail'];
+        $p    = max(0.0, min(100.0, $percent));
+        $pass = $p >= $passingScore;
+
+        if ($p >= 80) return ['A', 'Excellent', $pass];
+        if ($p >= 70) return ['B', 'Very good', $pass];
+        if ($p >= 60) return ['C', 'Good',      $pass];
+        if ($p >= 50) return ['D', $pass ? 'Pass' : 'Below pass', $pass];
+        return ['F', 'Fail', $pass];
     }
 }
-// false = grade + remark are live: they follow the points earned so far and change as points grow
-// true  = grade + remark appear only once the final exam (UE or supplementary) is done
-const ZAD_GRADE_AFTER_FINAL_ONLY = false;
 
 // ----------------------------------------------------------------------------
-// Build subject cards — points-based
+// Build subject cards — pure POINTS model.
 //
-// NOTE: All grade values here come from enrollment_course_grades, which is
-// per-enrollment (enrollment_id, division_id, subject_id). No course_id scoping
-// is needed here — the upstream grade-book sync (academyRecordScheduled /
-// academyRecordAttempt) already writes per-course/per-enrollment.
+//   subject_total_mark = quiz_total_points + exam_total_points + final_total_points   (normally 30+20+50 = 100)
+//   points_earned      = weekly_total + monthly_total + best(final_score, supplementary_score)
+//   supplementary      = counted up to course_subjects.supplementary_max_score points
+//
+// Every bucket is clamped to its own budget, so a subject can never show more than its total mark.
+// Grade + remark are LIVE: they follow the points earned so far and move up as points grow.
+// Status (Pass / Fail) is only given once the final exam (or the supplementary) has been taken.
 // ----------------------------------------------------------------------------
 $subjectCards = [];
 foreach ($courseSubjects as $cs) {
     $sid = (int)$cs['subject_id'];
     $grade = $gradeBySubject[$sid] ?? null;
 
-    $projected = null;
-    $final = null;
-    $status = 'in_progress';
-    $finalTaken = false;
-    $suppTaken  = false;
-
     $quizBudget  = (int)($cs['quiz_total_points']  ?? 0);
     $examBudget  = (int)($cs['exam_total_points']  ?? 0);
     $finalBudget = (int)($cs['final_total_points'] ?? 0);
+    $subjectTotalMark = $quizBudget + $examBudget + $finalBudget;
+    $subjectPassing   = (int)($cs['passing_score'] ?? 50);
+    $suppCap          = isset($cs['supplementary_max_score']) ? (int)$cs['supplementary_max_score'] : $finalBudget;
+    if ($suppCap <= 0 || $suppCap > $finalBudget) { $suppCap = $finalBudget; }
+    $passPoints       = (int)ceil($subjectTotalMark * $subjectPassing / 100);
+
+    $status     = 'in_progress';
+    $finalTaken = false;
+    $suppTaken  = false;
+
+    $weeklyEarned  = 0.0;
+    $monthlyEarned = 0.0;
+    $finalEarned   = null;
+    $suppEarned    = null;
+    $finalSlot     = null;
+    $totalEarned   = 0.0;
 
     if ($grade) {
-        $projected = courseComputeProjectedGrade($grade, $cs);
-        $final = courseComputeGrade($grade, $cs);
-        $status = (string)$grade['status'];
+        $status     = (string)$grade['status'];
         $finalTaken = (int)$grade['final_attempted'] === 1;
         $suppTaken  = (int)$grade['supplementary_attempted'] === 1;
 
-        $weeklyEarned  = (float)$grade['weekly_total'];
-        $monthlyEarned = (float)$grade['monthly_total'];
-        $finalEarned   = $grade['final_score'] !== null ? (float)$grade['final_score'] : null;
-        $suppEarned    = ((int)$grade['supplementary_attempted'] === 1 && $grade['supplementary_score'] !== null)
-            ? (float)$grade['supplementary_score']
+        $weeklyEarned  = min((float)$grade['weekly_total'],  (float)$quizBudget);
+        $monthlyEarned = min((float)$grade['monthly_total'], (float)$examBudget);
+
+        $finalEarned = $grade['final_score'] !== null
+            ? min((float)$grade['final_score'], (float)$finalBudget)
+            : null;
+        $suppEarned = ($suppTaken && $grade['supplementary_score'] !== null)
+            ? min((float)$grade['supplementary_score'], (float)$suppCap)
             : null;
 
-        if ($finalEarned === null && $suppEarned === null) {
-            $finalSlot = null;
-        } else {
-            $finalSlot = max($finalEarned ?? 0.0, $suppEarned ?? 0.0);
-        }
-
+        // the final slot is the better of final / supplementary
+        $finalSlot = ($finalEarned === null && $suppEarned === null)
+            ? null
+            : max($finalEarned ?? 0.0, $suppEarned ?? 0.0);
         $totalEarned = $weeklyEarned + $monthlyEarned + ($finalSlot ?? 0.0);
-    } else {
-        $weeklyEarned  = 0.0;
-        $monthlyEarned = 0.0;
-        $finalEarned   = null;
-        $suppEarned    = null;
-        $finalSlot     = null;
-        $totalEarned   = 0.0;
     }
 
-    $totalBudget = $quizBudget + $examBudget + $finalBudget;
+    $totalEarned = $subjectTotalMark > 0 ? min($totalEarned, (float)$subjectTotalMark) : 0.0;
+    $percent = $subjectTotalMark > 0 ? round($totalEarned / $subjectTotalMark * 100, 1) : 0.0;
 
-    $finalExam   = $examsBySubject['final'][$sid]         ?? null;
-    $suppExam    = $examsBySubject['supplementary'][$sid] ?? null;
+    $decided = $finalTaken || $suppTaken;
+    if ($decided) {
+        // the grade book normally stores passed/failed; fall back to the points if it was not updated
+        $isPass = $status === 'passed' || ($status !== 'failed' && $percent >= $subjectPassing);
+    } else {
+        $isPass = false;
+    }
 
+    [$letter, $remark] = zadGradeFromPercent($percent, $subjectPassing);
+    if (!$decided && $letter === 'F') {
+        $remark = 'Below pass';          // under 50 before the final exam is not a fail yet
+    }
+
+    $finalExam    = $examsBySubject['final'][$sid]         ?? null;
+    $suppExam     = $examsBySubject['supplementary'][$sid] ?? null;
     $canTakeFinal = $finalExam && !$finalTaken;
     $canTakeSupp  = $suppExam && $finalTaken && $status === 'failed' && !$suppTaken;
 
@@ -228,7 +328,8 @@ foreach ($courseSubjects as $cs) {
         'id'            => $sid,
         'name'          => $cs['name'],
         'icon'          => $cs['icon'] ?: '📖',
-        'passing_score' => (int)$cs['passing_score'],
+        'passing_score' => $subjectPassing,
+        'pass_points'   => $passPoints,
 
         'points' => [
             'weekly_earned'   => $weeklyEarned,
@@ -237,16 +338,20 @@ foreach ($courseSubjects as $cs) {
             'monthly_budget'  => $examBudget,
             'final_earned'    => $finalEarned,
             'final_budget'    => $finalBudget,
+            'supp_earned'     => $suppEarned,
+            'supp_cap'        => $suppCap,
             'total_earned'    => $totalEarned,
-            'total_budget'    => $totalBudget,
-            'percent'         => $totalBudget > 0 ? round($totalEarned / $totalBudget * 100, 1) : 0.0,
+            'total_budget'    => $subjectTotalMark,
+            'percent'         => $percent,
         ],
 
-        'final_taken' => $finalTaken,
-        'supp_taken'  => $suppTaken,
-        'projected'   => $projected,
-        'final'       => $final,
-        'status'      => $status,
+        'final_taken'     => $finalTaken,
+        'supp_taken'      => $suppTaken,
+        'decided'         => $decided,
+        'is_pass'         => $isPass,
+        'letter'          => $letter,
+        'remark'          => $remark,
+        'status'          => $status,
 
         'final_exam'      => $finalExam,
         'supp_exam'       => $suppExam,
@@ -259,12 +364,135 @@ foreach ($courseSubjects as $cs) {
     ];
 }
 
+// ============================================================================
+// ISSUE 5 — Course-level rollup (one row across all subjects).
+// Points-based. Percent derived from the sum of subject total marks.
+// ============================================================================
+$courseTotals = [
+    'earned'  => 0.0,
+    'budget'  => 0,
+    'percent' => 0.0,
+    'letter'  => '—',
+    'remark'  => '—',
+    'status'  => 'In progress',
+    'is_pass' => false,
+    'decided' => false,
+];
+
+if ($subjectCards) {
+    $allDecided = true;
+    $anyFail    = false;
+    foreach ($subjectCards as $sc) {
+        $courseTotals['earned'] += (float)$sc['points']['total_earned'];
+        $courseTotals['budget'] += (int)$sc['points']['total_budget'];
+        if (!$sc['decided']) $allDecided = false;
+        if ($sc['decided'] && !$sc['is_pass']) $anyFail = true;
+    }
+
+    $courseTotals['earned'] = min($courseTotals['earned'], (float)$courseTotals['budget']);
+
+    if ($courseTotals['budget'] > 0) {
+        $courseTotals['percent'] = round(
+            $courseTotals['earned'] / $courseTotals['budget'] * 100,
+            1
+        );
+    }
+
+    $courseTotals['decided'] = $allDecided;
+    $courseTotals['is_pass'] = $allDecided && !$anyFail;
+    $courseTotals['status']  = $allDecided
+        ? ($courseTotals['is_pass'] ? 'Pass' : 'Fail')
+        : 'In progress';
+
+    $coursePassing = (int)($curDiv['passing_score'] ?? 50);
+    [$lt, $rm] = zadGradeFromPercent($courseTotals['percent'], $coursePassing);
+    $courseTotals['letter'] = $lt;
+    $courseTotals['remark'] = $allDecided
+        ? $rm
+        : ($rm === 'Fail' ? 'Below pass' : 'Projected');
+}
+
+// ============================================================================
+// ISSUE 1 — Past divisions for this enrollment
+// ============================================================================
+$pastDivisions = [];
+try {
+    $stmt = $conn->prepare("
+        SELECT h.division_id, h.status, h.average_grade, h.completed_at,
+               cd.number, cd.name, cd.start_date, cd.end_date
+        FROM enrollment_division_history h
+        JOIN course_divisions cd ON cd.id = h.division_id
+        WHERE h.enrollment_id = ?
+        ORDER BY cd.number ASC
+    ");
+    $stmt->execute([(int)$en['id']]);
+    foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $r) {
+        $pastDivisions[] = [
+            'id'         => (int)$r['division_id'],
+            'number'     => (int)$r['number'],
+            'name'       => (string)$r['name'],
+            'status'     => (string)$r['status'],
+            'avg'        => $r['average_grade'] !== null ? (float)$r['average_grade'] : null,
+            'ended'      => (string)$r['completed_at'],
+            'start'      => (string)$r['start_date'],
+            'end'        => (string)$r['end_date'],
+            'is_current' => $curDiv && (int)$curDiv['id'] === (int)$r['division_id'],
+        ];
+    }
+} catch (PDOException $e) {
+    error_log('course.php past divisions: ' . $e->getMessage());
+}
+
+// ============================================================================
+// ISSUE 2 — Top performers for this course
+// ============================================================================
+$topPerformers = [];
+try {
+    $stmt = $conn->prepare("
+        SELECT
+            u.id            AS user_id,
+            u.username,
+            u.full_name,
+            u.profile_image,
+            AVG(g.course_grade)           AS avg_grade,
+            COUNT(DISTINCT g.subject_id)  AS subjects_count,
+            COUNT(DISTINCT g.division_id) AS divisions_count
+        FROM enrollment_course_grades g
+        JOIN course_enrollments en ON en.id = g.enrollment_id
+        JOIN users u               ON u.id  = en.user_id
+        JOIN course_divisions cd   ON cd.id = g.division_id
+        WHERE cd.course_id = ?
+          AND g.course_grade IS NOT NULL
+          AND en.status IN ('active','completed')
+          AND u.is_active = 1
+        GROUP BY u.id, u.username, u.full_name, u.profile_image
+        ORDER BY avg_grade DESC, subjects_count DESC
+        LIMIT 10
+    ");
+    $stmt->execute([$courseId]);
+    $rank = 1;
+    foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $r) {
+        $name = (string)($r['username'] ?: ($r['full_name'] ?: 'User'));
+        $topPerformers[] = [
+            'rank'          => $rank++,
+            'user_id'       => (int)$r['user_id'],
+            'display_name'  => $name,
+            'profile_image' => $r['profile_image'] ?: null,
+            'initials'      => strtoupper(mb_substr($name, 0, 2)),
+            'avg_grade'     => round((float)$r['avg_grade'], 1),
+            'is_me'         => (int)$r['user_id'] === $userId,
+            'subjects'      => (int)$r['subjects_count'],
+            'divisions'     => (int)$r['divisions_count'],
+        ];
+    }
+} catch (PDOException $e) {
+    error_log('course.php top performers: ' . $e->getMessage());
+}
+
 // Supplementary warning banner
 $suppWarnings = [];
 foreach ($subjectCards as $sc) {
-    if ($sc['can_take_supp']) {
-        $suppWarnings[] = $sc['name'];
-    }
+    if ($sc['can_take_supp']) $suppWarnings[] = $sc['name'];
 }
 
 // Timetable
@@ -289,33 +517,25 @@ if ($timetable && $progress['state'] === 'in_progress') {
     }
 }
 
-// Certificate availability
 $courseCompleted = ($en['status'] === 'completed');
 
 $flash = courseTakeFlash();
 
 courseShellStart($ctx, (string)$en['course_title']);
-// Resolve the course image to a browser URL, or fall back to academy default
-$heroImageUrl = '/uploads/myislam-academyc.png';
 
+$heroImageUrl = '/uploads/myislam-academyc.png';
 if (!empty($courseImagePath)) {
     $candidate = trim((string)$courseImagePath);
-
     if (preg_match('~^(https?:)?//~i', $candidate)) {
-        // Absolute URL — use as-is
         $heroImageUrl = $candidate;
     } else {
         $relative = '/' . ltrim($candidate, '/');
         $abs = ($_SERVER['DOCUMENT_ROOT'] ?? '') . $relative;
-
         if (is_file($abs)) {
             $heroImageUrl = $relative;
         } else {
-            // Try relative to course.php's own folder (subfolder installs)
             $abs2 = __DIR__ . $relative;
-            if (is_file($abs2)) {
-                $heroImageUrl = $relative;
-            }
+            if (is_file($abs2)) $heroImageUrl = $relative;
         }
     }
 }
@@ -353,42 +573,39 @@ if (!empty($courseImagePath)) {
     }
 
     /* ============ HERO ============ */
-   .course-hero {
-    position: relative;
-    border-radius: var(--radius-lg);
-    padding: clamp(16px, 3.5vw, 26px);
-    color: #fff;
-    overflow: hidden;
-    margin-bottom: 14px;
-    width: 100%;
-    background:
-        linear-gradient(rgba(10,40,30,.45), rgba(10,40,30,.75)),
-        url('<?php echo e($heroImageUrl); ?>') center/cover no-repeat,
-        #0E4A34;
-}
+    .course-hero {
+        position: relative;
+        border-radius: var(--radius-lg);
+        padding: clamp(16px, 3.5vw, 26px);
+        color: #fff;
+        overflow: hidden;
+        margin-bottom: 14px;
+        width: 100%;
+        background:
+            linear-gradient(rgba(10,40,30,.45), rgba(10,40,30,.75)),
+            url('<?php echo e($heroImageUrl); ?>') center/cover no-repeat,
+            #0E4A34;
+    }
     .course-hero > * { position: relative; z-index: 1; }
 
-    /* Hero title — GOLD, bigger (bulletproof) */
-.course-hero h1,
-.course-hero .rtl-title {
-    color: #D9BC72 !important;
-    font-size: 28px !important;
-    font-weight: 900 !important;
-    margin: 0 auto;
-    letter-spacing: .4px;
-    line-height: 1.2;
-    text-shadow: 0 2px 8px rgba(0,0,0,.65), 0 1px 2px rgba(0,0,0,.45);
-    text-align: center;
-    direction: rtl;
-    unicode-bidi: isolate;
-    display: block;
-    width: 100%;
-}
+    .course-hero h1,
+    .course-hero .rtl-title {
+        color: #D9BC72 !important;
+        font-size: 28px !important;
+        font-weight: 900 !important;
+        margin: 0 auto;
+        letter-spacing: .4px;
+        line-height: 1.2;
+        text-shadow: 0 2px 8px rgba(0,0,0,.65), 0 1px 2px rgba(0,0,0,.45);
+        text-align: center;
+        direction: rtl;
+        unicode-bidi: isolate;
+        display: block;
+        width: 100%;
+    }
     @media (max-width: 400px) {
         .course-hero h1,
-        .course-hero .rtl-title {
-            font-size: clamp(22px, 6vw, 28px) !important;
-        }
+        .course-hero .rtl-title { font-size: clamp(22px, 6vw, 28px) !important; }
     }
 
     .course-hero .meta {
@@ -399,7 +616,6 @@ if (!empty($courseImagePath)) {
         line-height: 1.5;
     }
 
-    /* ============ HERO BADGES — 5px radius ============ */
     .course-hero .badges {
         display: flex;
         flex-wrap: wrap;
@@ -435,10 +651,10 @@ if (!empty($courseImagePath)) {
         border-color: #D9BC72;
         color: #fff;
     }
-    .course-hero .badges .badge.gold { background: rgba(217,188,114,.95); color: #1a1a1a; border-color: #D9BC72; text-shadow: none; }
-    .course-hero .badges .badge.brand { background: rgba(127,202,164,.9); color: #0A3626; border-color: #7fcaa4; text-shadow: none; }
-    .course-hero .badges .badge.danger { background: rgba(239,68,68,.9); color: #fff; border-color: #ef4444; }
-    .course-hero .badges .badge.muted { background: rgba(255,255,255,.12); color: rgba(255,255,255,.85); }
+    .course-hero .badges .badge.gold   { background: rgba(217,188,114,.95); color: #1a1a1a; border-color: #D9BC72; text-shadow: none; }
+    .course-hero .badges .badge.brand  { background: rgba(127,202,164,.9);  color: #0A3626; border-color: #7fcaa4; text-shadow: none; }
+    .course-hero .badges .badge.danger { background: rgba(239,68,68,.9);    color: #fff;    border-color: #ef4444; }
+    .course-hero .badges .badge.muted  { background: rgba(255,255,255,.12); color: rgba(255,255,255,.85); }
 
     .course-hero .progress-bar {
         margin-top: 12px;
@@ -568,7 +784,6 @@ if (!empty($courseImagePath)) {
     }
     .subject-card .icon { font-size: 20px; line-height: 1; flex-shrink: 0; }
 
-    /* Subject title — GOLD, bulletproof */
     .subject-card .name,
     .subject-card.has-bg .name {
         font-weight: 800;
@@ -585,7 +800,6 @@ if (!empty($courseImagePath)) {
         unicode-bidi: isolate;
     }
 
-    /* Subject badge */
     .subject-card .grade-badge {
         font-size: 10.5px;
         font-weight: 800;
@@ -788,7 +1002,6 @@ if (!empty($courseImagePath)) {
     }
     .zd-footer a:hover { border-color: var(--brand); color: var(--gold); }
 
-    /* ============ TIMETABLE — item-type badge ============ */
     .zd-subject .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1 1 auto; }
     .zd-type {
         flex-shrink: 0 !important;
@@ -1000,6 +1213,53 @@ if (!empty($courseImagePath)) {
     .subject-card.has-bg .stat { background: rgba(255,255,255,.15); color: rgba(255,255,255,.9); }
     .subject-card.has-bg .stat strong { color: #fff; }
 
+
+    /* ============ EXAMINATION RESULTS CARD ============ */
+    .er-card > h2 small { margin-left: auto; font-size: 10.5px; font-weight: 700; text-transform: none; letter-spacing: 0; }
+    .er-card > h2 small a { color: var(--brand); text-decoration: none; }
+    .er-card > h2 small a:hover { text-decoration: underline; }
+    .er-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin-bottom: 10px; }
+    .er-stat { text-align: center; padding: 7px 4px; border-radius: 8px; background: var(--surface-2); border: 1px solid var(--line); }
+    .er-stat strong { display: block; font-size: 16px; font-weight: 800; color: var(--text); line-height: 1.1; }
+    .er-stat span { display: block; margin-top: 2px; font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: .3px; color: var(--muted); }
+    .er-stat.ok strong { color: #15803d; }
+    .er-stat.bad strong { color: #b91c1c; }
+    .er-stat.gold strong { color: var(--gold); }
+    body.dark-mode .er-stat.ok strong { color: #7fcaa4; }
+    body.dark-mode .er-stat.bad strong { color: #ef4444; }
+    .er-list { display: grid; gap: 6px; }
+    .er-row {
+        display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 8px;
+        padding: 8px 10px; border-radius: 8px; text-decoration: none; color: var(--text);
+        background: var(--surface-2); border: 1px solid var(--line); box-shadow: inset 3px 0 0 var(--brand);
+        transition: border-color .15s, background .15s;
+    }
+    .er-row:hover { border-color: var(--brand); background: var(--brand-soft); }
+    .er-type {
+        font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: .3px; padding: 2px 7px; border-radius: 999px;
+        background: var(--brand-soft); color: var(--brand); white-space: nowrap;
+    }
+    .er-type.t-monthly { background: var(--accent-soft); color: var(--accent); }
+    .er-type.t-final, .er-type.t-supp { background: var(--gold-soft); color: var(--gold); }
+    .er-body { display: flex; flex-direction: column; min-width: 0; text-align: right; unicode-bidi: isolate; }
+    .er-subject { font-size: 12px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .er-date { font-size: 10px; color: var(--muted); direction: ltr; text-align: right; }
+    .er-score { display: flex; align-items: baseline; gap: 4px; white-space: nowrap; flex-wrap: wrap; justify-content: flex-end; }
+    .er-score strong { font-size: 14px; font-weight: 800; }
+    .er-score em { font-style: normal; font-size: 10px; color: var(--muted); font-weight: 700; margin-right: 2px; }
+    .er-badge { font-size: 9px; font-weight: 800; padding: 1px 6px; border-radius: 5px; border: 1px solid transparent; }
+    .er-badge.pass { background: rgba(127,202,164,.18); border-color: rgba(127,202,164,.55); color: #2f7a55; }
+    .er-badge.fail { background: rgba(239,68,68,.14); border-color: rgba(239,68,68,.5); color: #b91c1c; }
+    body.dark-mode .er-badge.pass { color: #7fcaa4; }
+    body.dark-mode .er-badge.fail { color: #ef4444; }
+    .er-more { display: block; text-align: center; margin-top: 8px; font-size: 11px; font-weight: 800; color: var(--brand); text-decoration: none; }
+    .er-more:hover { text-decoration: underline; }
+    .er-empty { text-align: center; padding: 14px 8px; font-size: 11.5px; color: var(--muted); line-height: 1.5; }
+    @media (max-width: 400px) {
+        .er-row { padding: 7px 8px; gap: 6px; }
+        .er-subject { font-size: 11.5px; }
+    }
+
     /* ============ MOBILE ORDER (≤ 800px) ============ */
     @media (max-width: 800px) {
         .zad-grid {
@@ -1014,9 +1274,12 @@ if (!empty($courseImagePath)) {
         .zad-grid > .zad-timetable { display: block; width: 100%; }
         .zad-main > * { order: 0; }
         .zad-timetable { order: 10; }
-        .zad-grid > aside > .card:nth-child(1) { order: 20; }
-        .zad-grid > aside > .card:nth-child(2) { order: 99; }
-        .zad-grid > aside > .card { width: 100%; }
+
+        /* Aside cards flow in their natural document order ... */
+        .zad-grid > aside > .card { order: 20; width: 100%; }
+
+        /* ... except certificates, which always go to the very bottom */
+        .zad-grid > aside > .card.cert-section { order: 999; }
     }
 
     /* ============ MOBILE FINE-TUNING ============ */
@@ -1091,7 +1354,6 @@ if (!empty($courseImagePath)) {
         .cert-card .cert-action { font-size: 10.5px; }
     }
 
-    /* ============ TIMETABLE — mobile day tabs ============ */
     .zd-tabs { display: none; }
     .zd-item { box-shadow: inset 3px 0 0 var(--brand); align-items: start; }
     .zd-item.type-quiz { box-shadow: inset 3px 0 0 var(--gold); }
@@ -1156,7 +1418,6 @@ if (!empty($courseImagePath)) {
         .zd-type { font-size: 8.5px; padding: 1px 6px; }
     }
 
-    /* ============ GRADES CARD ============ */
     .grade-row { direction: rtl; }
     .grade-row .grade-row-name { text-align: right; unicode-bidi: isolate; min-width: 0; overflow-wrap: anywhere; }
     .grade-row .grade-badge {
@@ -1188,7 +1449,6 @@ if (!empty($courseImagePath)) {
     body.dark-mode .grade-row .grade-badge.fail    { color: #ef4444; }
     body.dark-mode .grade-row .grade-badge.pending { color: #D9BC72; }
 
-    /* ============ GRADES TABLE: Subject | Points | Grade | Remark | Status ============ */
     .grade-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
     .grade-table { width: 100%; border-collapse: collapse; table-layout: fixed; direction: rtl; font-size: 11px; }
     .grade-table th {
@@ -1243,8 +1503,73 @@ if (!empty($courseImagePath)) {
         .grade-table .grade-badge { font-size: 8.5px; padding: 2px 4px; }
     }
 
-    /* Section cards: 5px corners */
     .zad-grid .card { border-radius: 5px; }
+
+    /* ============ NEW — Past divisions list (Issue 1) ============ */
+    .past-divs { display: grid; gap: 6px; }
+    .past-div {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 10px;
+        background: var(--surface-2);
+        border: 1px solid var(--line);
+        border-left: 3px solid var(--muted);
+        border-radius: 5px;
+        font-size: 11.5px;
+    }
+    .past-div.is-current { border-left-color: var(--brand); background: var(--brand-soft); }
+    .past-div.passed { border-left-color: #15803d; }
+    .past-div.failed { border-left-color: #b91c1c; }
+    .past-div .pd-num {
+        font-weight: 800; font-size: 10px; text-transform: uppercase;
+        padding: 2px 8px; border-radius: 5px;
+        background: var(--surface-3); color: var(--text-secondary);
+        flex-shrink: 0;
+    }
+    .past-div.is-current .pd-num { background: var(--brand); color: #fff; }
+    .past-div .pd-name { flex: 1; font-weight: 700; color: var(--text); min-width: 0; overflow-wrap: anywhere; }
+    .past-div .pd-meta { font-size: 10px; color: var(--muted); font-weight: 600; white-space: nowrap; }
+    .past-div .pd-status {
+        font-weight: 800; font-size: 10px; text-transform: uppercase;
+        padding: 2px 8px; border-radius: 5px;
+    }
+    .past-div.passed .pd-status { background: rgba(21,128,61,.12); color: #15803d; }
+    .past-div.failed .pd-status { background: rgba(185,28,28,.10); color: #b91c1c; }
+    .past-div .pd-status.pending { background: var(--surface-3); color: var(--muted); }
+
+    /* ============ NEW — Top performers (Issue 2) ============ */
+    .perf-list { display: grid; gap: 5px; }
+    .perf-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 6px 9px;
+        background: var(--surface-2);
+        border: 1px solid var(--line);
+        border-radius: 5px;
+        font-size: 11.5px;
+    }
+    .perf-row.is-me { border-color: var(--brand); background: var(--brand-soft); }
+    .perf-rank {
+        width: 22px; height: 22px; border-radius: 50%;
+        background: var(--surface-3); color: var(--muted);
+        display: flex; align-items: center; justify-content: center;
+        font-size: 10px; font-weight: 800; flex-shrink: 0;
+    }
+    .perf-row:nth-child(1) .perf-rank { background: #C6A64B; color: #fff; }
+    .perf-row:nth-child(2) .perf-rank { background: #8FD3E8; color: #0f1720; }
+    .perf-row:nth-child(3) .perf-rank { background: #6C5CC0; color: #fff; }
+    .perf-avatar {
+        width: 26px; height: 26px; border-radius: 50%;
+        background: linear-gradient(135deg, var(--brand), var(--brand-dark, #0A3626));
+        color: #fff; font-weight: 800; font-size: 10px;
+        display: flex; align-items: center; justify-content: center;
+        flex-shrink: 0; overflow: hidden;
+    }
+    .perf-avatar img { width: 100%; height: 100%; object-fit: cover; }
+    .perf-name { flex: 1; min-width: 0; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .perf-score { font-weight: 800; color: var(--gold); white-space: nowrap; font-variant-numeric: tabular-nums; }
 </style>
 
 <?php if ($flash): ?>
@@ -1304,50 +1629,205 @@ if (!empty($courseImagePath)) {
                         $pts      = $s['points'];
                         $earned   = (int)round($pts['total_earned']);
                         $budget   = (int)$pts['total_budget'];
-                        $decided  = ($s['final_taken'] || $s['supp_taken']);   // final exam (UE or supp) done
+                        $decided  = $s['decided'];
 
-                        // status: only pass / fail once the final exam is done
                         $statusCls = 'pending';
                         $statusTxt = 'In progress';
-                        if ($decided && $s['status'] === 'passed') { $statusCls = 'pass'; $statusTxt = 'Pass'; }
-                        elseif ($decided && $s['status'] === 'failed') { $statusCls = 'fail'; $statusTxt = 'Fail'; }
+                        if ($decided) {
+                            $statusCls = $s['is_pass'] ? 'pass' : 'fail';
+                            $statusTxt = $s['is_pass'] ? 'Pass' : 'Fail';
+                        }
 
-                        // grade + remark from the points percentage
-                        // live: shown as soon as the student has points, and recalculated on every page load
-                        $showGrade = $budget > 0
-                            && (float)$pts['total_earned'] > 0
-                            && (!ZAD_GRADE_AFTER_FINAL_ONLY || $decided);
                         $letter = '—';
                         $remark = '—';
-                        if ($showGrade) {
-                            [$letter, $remark] = zadLetterGrade((float)$pts['percent']);
-                            // below 50% before the final exam is not a fail yet
-                            if ($letter === 'F' && !$decided) {
-                                $remark = 'Below pass';
-                            }
+                        if ($budget > 0 && (float)$pts['total_earned'] > 0) {
+                            $letter = $s['letter'];
+                            $remark = $s['remark'];
                         }
                     ?>
                         <tr>
                             <td class="gt-subject" dir="rtl"><?php echo e($s['icon']); ?> <?php echo e($s['name']); ?></td>
                             <td class="gt-num"><?php echo $earned; ?><span class="gt-of">/<?php echo $budget; ?></span></td>
-                            <td><span class="gt-letter l-<?php echo $showGrade ? e($letter) : 'none'; ?>"><?php echo e($letter); ?></span></td>
+                            <td><span class="gt-letter l-<?php echo $letter !== '—' ? e($letter) : 'none'; ?>"><?php echo e($letter); ?></span></td>
                             <td class="gt-remark"><?php echo e($remark); ?></td>
                             <td><span class="grade-badge <?php echo $statusCls; ?>"><?php echo e($statusTxt); ?></span></td>
                         </tr>
                     <?php endforeach; ?>
                     </tbody>
+                    <tfoot>
+                        <tr style="border-top:2px solid var(--gold);font-weight:800;">
+                            <td class="gt-subject" dir="rtl" style="color:var(--gold);">📊 <?php echo e($divisionLabel); ?> total</td>
+                            <td class="gt-num" style="color:var(--gold);">
+                                <?php echo (int)round($courseTotals['earned']); ?><span class="gt-of">/<?php echo (int)$courseTotals['budget']; ?></span>
+                            </td>
+                            <td>
+                                <span class="gt-letter l-<?php echo $courseTotals['letter'] !== '—' ? e($courseTotals['letter']) : 'none'; ?>">
+                                    <?php echo e($courseTotals['letter']); ?>
+                                </span>
+                            </td>
+                            <td class="gt-remark"><?php echo e($courseTotals['remark']); ?></td>
+                            <td>
+                                <span class="grade-badge <?php
+                                    echo $courseTotals['status'] === 'Pass' ? 'pass'
+                                        : ($courseTotals['status'] === 'Fail' ? 'fail' : 'pending');
+                                ?>">
+                                    <?php echo e($courseTotals['status']); ?>
+                                </span>
+                            </td>
+                        </tr>
+                    </tfoot>
                 </table>
             </div>
             <div class="grade-legend">
-                <span><b>A</b> 80–100 Excellent</span>
-                <span><b>B</b> 70–79 Very good</span>
-                <span><b>C</b> 60–69 Good</span>
-                <span><b>D</b> 50–59 Pass</span>
+                <span><b>A</b> top tier</span>
+                <span><b>B</b> very good</span>
+                <span><b>C</b> pass</span>
+                <span><b>D</b> near pass</span>
+                <span><b>F</b> fail</span>
             </div>
         </section>
         <?php endif; ?>
 
-        <section class="card" style="margin-bottom:12px;">
+        <?php
+        // ---- Examination results of THIS course: weekly quizzes, monthly exams, final / supplementary exams ----
+        $examRows = [];
+        try {
+            $exStmt = $conn->prepare("
+                SELECT * FROM (
+                    SELECT 'weekly' AS src, qa.id, q.title, s.name AS subject_name,
+                           qa.score, qa.total_points, qa.passed, qa.completed_at
+                    FROM quiz_attempts qa
+                    JOIN quizzes q ON q.id = qa.quiz_id
+                    LEFT JOIN subjects s ON s.id = q.subject_id
+                    WHERE qa.user_id = ? AND qa.course_id = ? AND qa.status = 'completed'
+                    UNION ALL
+                    SELECT 'monthly', ma.id, me.title, s.name,
+                           ma.score, ma.total_points, ma.passed, ma.completed_at
+                    FROM monthly_exam_attempts ma
+                    JOIN monthly_exams me ON me.id = ma.exam_id
+                    LEFT JOIN subjects s ON s.id = me.subject_id
+                    WHERE ma.user_id = ? AND ma.course_id = ? AND ma.status = 'completed'
+                    UNION ALL
+                    SELECT IF(se.exam_type = 'supplementary', 'supp', 'final'), sa.id, se.title, s.name,
+                           sa.score, sa.total_points, sa.passed, sa.completed_at
+                    FROM semester_exam_attempts sa
+                    JOIN semester_exams se ON se.id = sa.exam_id
+                    LEFT JOIN course_subjects csx ON csx.id = se.course_subject_id
+                    LEFT JOIN subjects s ON s.id = csx.subject_id
+                    WHERE sa.user_id = ? AND sa.course_id = ? AND sa.status = 'completed'
+                ) x
+                ORDER BY completed_at DESC
+            ");
+            $exStmt->execute([$userId, $courseId, $userId, $courseId, $userId, $courseId]);
+            $examRows = $exStmt->fetchAll(PDO::FETCH_ASSOC);
+        } catch (PDOException $e) {
+            error_log('course.php examination results: ' . $e->getMessage());
+        }
+
+        $exTaken = count($examRows);
+        $exPassed = 0; $exFailed = 0; $exPts = 0.0; $exPossible = 0.0;
+        foreach ($examRows as $r) {
+            if ((int)$r['passed'] === 1) { $exPassed++; } else { $exFailed++; }
+            $exPts      += (float)$r['score'];
+            $exPossible += (float)$r['total_points'];
+        }
+        $exTypeLabel = ['weekly' => 'Quiz', 'monthly' => 'Monthly', 'final' => 'Final', 'supp' => 'Supp'];
+        ?>
+        <section class="card er-card">
+            <h2>🎓 Examination results
+                <small><a href="my_results.php?course_id=<?php echo (int)$courseId; ?>">View all →</a></small>
+            </h2>
+
+            <?php if ($exTaken === 0): ?>
+                <div class="er-empty">No quiz or exam taken yet in this course.<br>Your results will appear here.</div>
+            <?php else: ?>
+                <div class="er-stats">
+                    <div class="er-stat"><strong><?php echo $exTaken; ?></strong><span>Taken</span></div>
+                    <div class="er-stat ok"><strong><?php echo $exPassed; ?></strong><span>Passed</span></div>
+                    <div class="er-stat bad"><strong><?php echo $exFailed; ?></strong><span>Failed</span></div>
+                    <div class="er-stat gold"><strong><?php echo (int)round($exPts); ?></strong><span>Points</span></div>
+                </div>
+
+                <div class="er-list">
+                    <?php foreach (array_slice($examRows, 0, 6) as $r):
+                        $ok = (int)$r['passed'] === 1;
+                    ?>
+                        <a class="er-row" href="my_results.php?course_id=<?php echo (int)$courseId; ?>">
+                            <span class="er-type t-<?php echo e($r['src']); ?>"><?php echo e($exTypeLabel[$r['src']] ?? ucfirst($r['src'])); ?></span>
+                            <span class="er-body" dir="rtl">
+                                <span class="er-subject"><?php echo e((string)($r['subject_name'] ?? '')); ?></span>
+                                <span class="er-date"><?php echo $r['completed_at'] ? e(date('d M Y', strtotime((string)$r['completed_at']))) : ''; ?></span>
+                            </span>
+                            <span class="er-score">
+                                <strong><?php echo (int)round((float)$r['score']); ?></strong><em>/<?php echo (int)round((float)$r['total_points']); ?></em>
+                                <b class="er-badge <?php echo $ok ? 'pass' : 'fail'; ?>"><?php echo $ok ? 'Pass' : 'Fail'; ?></b>
+                            </span>
+                        </a>
+                    <?php endforeach; ?>
+                </div>
+                <?php if ($exTaken > 6): ?>
+                    <a class="er-more" href="my_results.php?course_id=<?php echo (int)$courseId; ?>">+ <?php echo $exTaken - 6; ?> more result<?php echo $exTaken - 6 === 1 ? '' : 's'; ?> →</a>
+                <?php endif; ?>
+            <?php endif; ?>
+        </section>
+
+        <?php if ($topPerformers): ?>
+        <section class="card">
+            <h2>🏆 Top performers</h2>
+            <div class="perf-list">
+                <?php foreach ($topPerformers as $p): ?>
+                <div class="perf-row <?php echo $p['is_me'] ? 'is-me' : ''; ?>">
+                    <span class="perf-rank">#<?php echo (int)$p['rank']; ?></span>
+                    <span class="perf-avatar">
+                        <?php if ($p['profile_image']): ?>
+                            <img src="<?php echo e($p['profile_image']); ?>" alt="">
+                        <?php else: ?>
+                            <?php echo e($p['initials']); ?>
+                        <?php endif; ?>
+                    </span>
+                    <span class="perf-name">
+                        <?php echo e($p['is_me'] ? 'You' : $p['display_name']); ?>
+                    </span>
+                    <span class="perf-score"><?php echo number_format($p['avg_grade'], 1); ?> pts</span>
+                </div>
+                <?php endforeach; ?>
+            </div>
+        </section>
+        <?php endif; ?>
+
+        <?php if ($pastDivisions): ?>
+        <section class="card">
+            <h2>📜 <?php echo e($divisionLabel); ?> history</h2>
+            <div class="past-divs">
+                <?php foreach ($pastDivisions as $pd):
+                    $pdCls = $pd['is_current'] ? 'is-current' : '';
+                    if ($pd['status'] === 'passed' || $pd['status'] === 'failed') {
+                        $pdCls .= ' ' . $pd['status'];
+                    }
+                ?>
+                <div class="past-div <?php echo e($pdCls); ?>">
+                    <span class="pd-num">#<?php echo (int)$pd['number']; ?></span>
+                    <span class="pd-name">
+                        <?php echo e($pd['name']); ?>
+                        <div class="pd-meta">
+                            <?php echo e(date('d M Y', strtotime($pd['start']))); ?>
+                            →
+                            <?php echo e(date('d M Y', strtotime($pd['end']))); ?>
+                            <?php if ($pd['avg'] !== null): ?>
+                                · Avg <?php echo number_format($pd['avg'], 1); ?> pts
+                            <?php endif; ?>
+                        </div>
+                    </span>
+                    <span class="pd-status <?php echo e($pd['status'] === 'passed' || $pd['status'] === 'failed' ? $pd['status'] : 'pending'); ?>">
+                        <?php echo e(ucfirst($pd['status'])); ?>
+                    </span>
+                </div>
+                <?php endforeach; ?>
+            </div>
+        </section>
+        <?php endif; ?>
+
+        <section class="card cert-section" style="margin-bottom:12px;">
             <h2>🎓 Certificates</h2>
 
             <?php
@@ -1360,7 +1840,7 @@ if (!empty($courseImagePath)) {
                       AND (subject_id IS NULL OR subject_id IN (
                           SELECT subject_id FROM course_subjects WHERE course_id = ?
                       ))
-                      AND certification_type IN ('course','division','subject')
+                      AND certification_type IN ('course','subject')
                     ORDER BY issued_at DESC
                     LIMIT 5
                 ");
@@ -1372,8 +1852,63 @@ if (!empty($courseImagePath)) {
                 error_log('course.php issued certificates query: ' . $e->getMessage());
             }
 
-            $hasCourseCert   = isset($issuedCerts['course']);
-            $hasDivisionCert = isset($issuedCerts['division']);
+            // ---- Course finished? Every division, from the one the student started in through the
+            //      course's last division, must be passed. (Enrollment marked completed also counts.)
+            $courseFinished = ($en['status'] === 'completed');
+            try {
+                $stmtF = $conn->prepare("
+                    SELECT COUNT(*) AS total,
+                           SUM(CASE WHEN h.status = 'passed' THEN 1 ELSE 0 END) AS passed
+                    FROM course_divisions cd
+                    LEFT JOIN enrollment_division_history h
+                           ON h.division_id = cd.id AND h.enrollment_id = ?
+                    WHERE cd.course_id = ?
+                      AND cd.number >= COALESCE((
+                            SELECT d2.number
+                            FROM course_enrollments e2
+                            JOIN course_divisions d2 ON d2.id = e2.starting_division_id
+                            WHERE e2.id = ?
+                          ), 1)
+                ");
+                $stmtF->execute([(int)$en['id'], $courseId, (int)$en['id']]);
+                $fin = $stmtF->fetch(PDO::FETCH_ASSOC) ?: ['total' => 0, 'passed' => 0];
+                if ((int)$fin['total'] > 0 && (int)$fin['passed'] === (int)$fin['total']) {
+                    $courseFinished = true;
+                }
+            } catch (PDOException $e) {
+                error_log('course.php course-finished check: ' . $e->getMessage());
+            }
+
+            // ---- Finished but no certificate yet: issue the Certificate of Completion now.
+            if ($courseFinished && !isset($issuedCerts['course'])) {
+                try {
+                    $conn->prepare("
+                        INSERT IGNORE INTO certificates
+                            (user_id, subject_id, certificate_code, certification_type,
+                             title, achievement_summary, completed_at, status)
+                        VALUES (?, NULL, ?, 'course', ?, ?, NOW(), 'active')
+                    ")->execute([
+                        $userId,
+                        'MYI-CRS-' . (int)$en['id'],
+                        'Course Certificate — ' . (string)$en['course_title'],
+                        'Successfully passed every subject in every division of ' . (string)$en['course_title'],
+                    ]);
+                    if ($en['status'] !== 'completed') {
+                        $conn->prepare("UPDATE course_enrollments
+                                        SET status = 'completed', division_status = 'completed',
+                                            completed_at = COALESCE(completed_at, NOW())
+                                        WHERE id = ?")->execute([(int)$en['id']]);
+                    }
+                    $stmtC->execute([$userId, $courseId]);
+                    foreach ($stmtC->fetchAll(PDO::FETCH_ASSOC) as $c) {
+                        $issuedCerts[$c['certification_type']] = $c;
+                    }
+                } catch (PDOException $e) {
+                    error_log('course.php issue completion certificate: ' . $e->getMessage());
+                }
+            }
+
+            $hasCourseCert = isset($issuedCerts['course']);
             ?>
 
             <div class="cert-card">
@@ -1394,7 +1929,7 @@ if (!empty($courseImagePath)) {
                 </div>
             </div>
 
-            <?php if ($courseCompleted && $hasCourseCert): ?>
+            <?php if ($courseFinished && $hasCourseCert): ?>
                 <div class="cert-card">
                     <div class="cert-preview">
                         <div class="cp-medallion">🏆</div>
@@ -1404,7 +1939,7 @@ if (!empty($courseImagePath)) {
                     </div>
                     <div class="cert-meta">
                         <h4>Certificate of Completion</h4>
-                        <p>You successfully passed every subject in every division.</p>
+                        <p>You passed every subject in every <?php echo e(strtolower($divisionLabel)); ?> of this course.</p>
                         <?php if (!empty($issuedCerts['course']['issued_at'])): ?>
                             <span class="cert-date">✅ Earned <?php echo e(date('d M Y', strtotime($issuedCerts['course']['issued_at']))); ?></span>
                         <?php endif; ?>
@@ -1429,37 +1964,14 @@ if (!empty($courseImagePath)) {
                     </div>
                     <div class="cert-meta">
                         <h4>Certificate of Completion</h4>
-                        <p>Pass every subject in every division to unlock.</p>
+                        <p>Available when you finish the course: pass every subject in every <?php echo e(strtolower($divisionLabel)); ?>.</p>
                         <span class="cert-action disabled">🔒 Locked</span>
                     </div>
                 </div>
             <?php endif; ?>
 
-            <?php if ($hasDivisionCert): ?>
-                <div class="cert-card">
-                    <div class="cert-preview">
-                        <div class="cp-medallion">🎓</div>
-                        <div class="cp-platform">MyIslam Academy</div>
-                        <div class="cp-title">Division<br>Certificate</div>
-                        <div class="cp-seal"></div>
-                    </div>
-                    <div class="cert-meta">
-                        <h4>Division Certificate</h4>
-                        <p><?php echo e((string)($issuedCerts['division']['title'] ?? 'Semester completed')); ?></p>
-                        <?php if (!empty($issuedCerts['division']['issued_at'])): ?>
-                            <span class="cert-date">✅ Earned <?php echo e(date('d M Y', strtotime($issuedCerts['division']['issued_at']))); ?></span>
-                        <?php endif; ?>
-                        <a class="cert-action"
-                           href="certificate_view.php?code=<?php echo e((string)$issuedCerts['division']['certificate_code']); ?>"
-                           target="_blank" rel="noopener">
-                            📄 View certificate →
-                        </a>
-                    </div>
-                </div>
-            <?php endif; ?>
-
             <p style="font-size:10.5px;color:var(--muted);margin-top:6px;line-height:1.45;text-align:center;">
-                Enrollment certifies registration. Completion and division certificates are issued automatically on passing.
+                Enrollment certifies registration. The Certificate of Completion is issued automatically when you finish the course.
             </p>
         </section>
     </aside>
@@ -1525,13 +2037,10 @@ if (!empty($courseImagePath)) {
                     $gradeClass = 'pending';
                     $gradeLabel = '— / ' . (int)$pts['total_budget'] . ' pts';
 
-                    if ($s['status'] === 'passed') {
-                        $gradeClass = 'pass';
+                    if ($s['decided']) {
+                        $gradeClass = $s['is_pass'] ? 'pass' : 'fail';
                         $gradeLabel = (int)round($pts['total_earned']) . ' / ' . (int)$pts['total_budget'] . ' pts';
-                    } elseif ($s['status'] === 'failed') {
-                        $gradeClass = 'fail';
-                        $gradeLabel = (int)round($pts['total_earned']) . ' / ' . (int)$pts['total_budget'] . ' pts';
-                    } elseif ($s['projected'] !== null) {
+                    } elseif ((float)$pts['total_earned'] > 0) {
                         $gradeLabel = '~' . (int)round($pts['total_earned']) . ' / ' . (int)$pts['total_budget'] . ' pts';
                     }
 
@@ -1578,6 +2087,11 @@ if (!empty($courseImagePath)) {
                                     <strong>
                                         <?php if ($s['final_taken'] || $pts['final_earned'] !== null): ?>
                                             <?php echo (int)round($pts['final_earned'] ?? 0); ?> / <?php echo (int)$pts['final_budget']; ?> pts
+                                            <?php if ($pts['supp_earned'] !== null): ?>
+                                                <span style="display:block;font-size:10px;font-weight:700;opacity:.85;">
+                                                    Supplementary: <?php echo (int)round($pts['supp_earned']); ?> / <?php echo (int)$pts['supp_cap']; ?> pts
+                                                </span>
+                                            <?php endif; ?>
                                         <?php else: ?>
                                             — / <?php echo (int)$pts['final_budget']; ?> pts
                                         <?php endif; ?>
@@ -1594,7 +2108,7 @@ if (!empty($courseImagePath)) {
                                     <div style="width: <?php echo min(100, (int)round($pts['percent'])); ?>%"></div>
                                 </div>
                                 <div style="font-size:10.5px;color:var(--muted);font-weight:700;text-align:right;margin-top:2px;">
-                                    <?php echo number_format($pts['percent'], 1); ?>% (pass ≥ <?php echo (int)$s['passing_score']; ?>%)
+                                    Pass mark: <?php echo (int)$s['pass_points']; ?> pts
                                 </div>
                             <?php endif; ?>
                         </a>
@@ -1605,7 +2119,7 @@ if (!empty($courseImagePath)) {
                                href="<?php echo e($cardCta['href']); ?>">
                                 <?php echo $cardCta['label']; ?>
                             </a>
-                        <?php elseif ($s['final_taken'] && !$s['supp_taken'] && $s['status'] === 'passed'): ?>
+                        <?php elseif ($s['final_taken'] && !$s['supp_taken'] && $s['is_pass']): ?>
                             <div style="margin-top:8px;font-size:11.5px;color:var(--brand);font-weight:700;text-align:center;padding:4px;">
                                 ✅ Final passed
                             </div>

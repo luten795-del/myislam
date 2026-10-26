@@ -62,7 +62,6 @@ if ($tablesReady) {
     try {
         $myEnrollments = courseLoadMyEnrollments($conn, $userId);
 
-        // Augment with course image_path
         if ($myEnrollments) {
             $ids = array_column($myEnrollments, 'course_id');
             $in  = implode(',', array_fill(0, count($ids), '?'));
@@ -83,7 +82,7 @@ if ($tablesReady) {
             if (!empty($en['current_div_start'])) {
                 $progress = courseComputeDivisionProgress([
                     'start_date' => $en['current_div_start'],
-                    'end_date' => $en['current_div_end'],
+                    'end_date'   => $en['current_div_end'],
                 ], $today);
             }
             $en['_progress'] = $progress;
@@ -93,32 +92,49 @@ if ($tablesReady) {
             $en['_exams_ready'] = 0;
 
             if (!empty($en['current_div_id'])) {
-                $enrollId = (int)$en['id'];
-                $divId    = (int)$en['current_div_id'];
+                $enrollId       = (int)$en['id'];
+                $divId          = (int)$en['current_div_id'];
                 $courseIdForRow = (int)$en['course_id'];
 
+                // ------------------------------------------------------------------
+                // POINTS model (same as course.php):
+                //   subject mark   = quiz_total_points + exam_total_points + final_total_points  (normally 100)
+                //   points earned  = weekly + monthly + best(final, supplementary)   — each part capped at its budget
+                //   _avg_grade     = average points earned per subject in this division
+                // ------------------------------------------------------------------
                 try {
                     $gStmt = $conn->prepare("
                         SELECT
                             AVG(
-                                (g.weekly_total + g.monthly_total + COALESCE(g.final_score, 0))
-                                / NULLIF(cs.quiz_total_points + cs.exam_total_points + cs.final_total_points, 0)
-                                * 100
-                            ) AS avg_progress,
+                                LEAST(
+                                    LEAST(g.weekly_total,  cs.quiz_total_points)
+                                  + LEAST(g.monthly_total, cs.exam_total_points)
+                                  + LEAST(
+                                        GREATEST(
+                                            COALESCE(g.final_score, 0),
+                                            CASE WHEN g.supplementary_attempted = 1
+                                                 THEN LEAST(COALESCE(g.supplementary_score, 0), cs.supplementary_max_score)
+                                                 ELSE 0 END
+                                        ),
+                                        cs.final_total_points
+                                    ),
+                                    cs.quiz_total_points + cs.exam_total_points + cs.final_total_points
+                                )
+                            ) AS avg_points,
                             COUNT(*) AS graded
                         FROM enrollment_course_grades g
                         JOIN course_subjects cs
-                             ON cs.course_id = (SELECT course_id FROM course_enrollments WHERE id = g.enrollment_id)
+                             ON cs.course_id = ?
                             AND cs.subject_id = g.subject_id
                         WHERE g.enrollment_id = ? AND g.division_id = ?
                     ");
-                    $gStmt->execute([$enrollId, $divId]);
+                    $gStmt->execute([$courseIdForRow, $enrollId, $divId]);
                     $gRow = $gStmt->fetch(PDO::FETCH_ASSOC);
-                    if ($gRow && (int)$gRow['graded'] > 0 && $gRow['avg_progress'] !== null) {
-                        $en['_avg_grade'] = round((float)$gRow['avg_progress'], 1);
+                    if ($gRow && (int)$gRow['graded'] > 0 && $gRow['avg_points'] !== null) {
+                        $en['_avg_grade'] = round((float)$gRow['avg_points'], 1);
                     }
                 } catch (PDOException $e) {
-                    error_log('courses.php avg_progress error: ' . $e->getMessage());
+                    error_log('courses.php avg_points error: ' . $e->getMessage());
                 }
 
                 try {
@@ -136,38 +152,49 @@ if ($tablesReady) {
                     error_log('courses.php div_status error: ' . $e->getMessage());
                 }
 
-                // Course-scoped so attempts recorded against a different course
-                // for the same exam id (unlikely, but possible if exams are
-                // shared across courses) don't hide the CTA.
                 try {
                     $eStmt = $conn->prepare("
-                        SELECT COUNT(*) FROM semester_exams se
+                        SELECT COUNT(*)
+                        FROM semester_exams se
+                        JOIN course_subjects cs ON cs.id = se.course_subject_id
                         WHERE se.division_id = ?
-                          AND se.status = 'published'
+                          AND cs.course_id    = ?
+                          AND se.status       = 'published'
                           AND se.allow_access = 1
+                          AND (se.start_date IS NULL OR se.start_date <= NOW())
+                          AND (se.end_date   IS NULL OR se.end_date   >= NOW())
                           AND (
-                                se.exam_type = 'final'
-                             OR (se.exam_type = 'supplementary'
-                                 AND EXISTS (
-                                     SELECT 1 FROM enrollment_course_grades g
-                                     WHERE g.enrollment_id = ?
-                                       AND g.division_id = ?
-                                       AND g.subject_id = (SELECT cs.subject_id FROM course_subjects cs WHERE cs.id = se.course_subject_id)
-                                       AND g.final_attempted = 1
-                                       AND g.status = 'failed'
-                                       AND g.supplementary_attempted = 0
-                                 ))
-                          )
-                          AND NOT EXISTS (
-                              SELECT 1 FROM semester_exam_attempts sea
-                              WHERE sea.exam_id = se.id
-                                AND sea.user_id = ?
-                                AND sea.status IN ('completed','started')
-                                AND (sea.course_id = ? OR sea.course_id IS NULL)
-                                AND (sea.enrollment_id = ? OR sea.enrollment_id IS NULL)
+                                (
+                                    se.exam_type = 'final'
+                                    AND NOT EXISTS (
+                                        SELECT 1 FROM enrollment_course_grades g
+                                        WHERE g.enrollment_id = ?
+                                          AND g.division_id   = ?
+                                          AND g.subject_id    = cs.subject_id
+                                          AND g.final_attempted = 1
+                                    )
+                                )
+                                OR
+                                (
+                                    se.exam_type = 'supplementary'
+                                    AND EXISTS (
+                                        SELECT 1 FROM enrollment_course_grades g
+                                        WHERE g.enrollment_id = ?
+                                          AND g.division_id   = ?
+                                          AND g.subject_id    = cs.subject_id
+                                          AND g.final_attempted = 1
+                                          AND g.status = 'failed'
+                                          AND g.supplementary_attempted = 0
+                                    )
+                                )
                           )
                     ");
-                    $eStmt->execute([$divId, $enrollId, $divId, $userId, $courseIdForRow, $enrollId]);
+                    $eStmt->execute([
+                        $divId,
+                        $courseIdForRow,
+                        $enrollId, $divId,
+                        $enrollId, $divId,
+                    ]);
                     $en['_exams_ready'] = (int)$eStmt->fetchColumn();
                 } catch (PDOException $e) {
                     error_log('courses.php exams_ready error: ' . $e->getMessage());
@@ -176,10 +203,6 @@ if ($tablesReady) {
         }
         unset($en);
 
-        // Prefer active enrollment over dropped when the user has multiple
-        // rows for the same course (e.g. dropped then re-enrolled). Without
-        // this, a course with an active + dropped row could show up as
-        // "re-enrollable" — a duplicate-enrollment edge case.
         $stmt = $conn->prepare("
             SELECT c.*,
                    (SELECT COUNT(*) FROM course_divisions d WHERE d.course_id = c.id AND d.start_date > ?) AS upcoming_divisions,
@@ -227,39 +250,52 @@ $academyPodium      = [];
 $academyScoreboard  = [];
 
 if ($tablesReady) {
-    // Global aggregation across all three attempt tables — deliberately
-    // cross-course because "My Progress" and the podium are platform-wide.
+    // Academy attempts only (weekly competition quizzes tied to a course + monthly + semester exams).
+    // Everything is summed in POINTS; percentages are not used for ranking.
     $perUserSql = "
         SELECT
             user_id,
-            COUNT(*)              AS attempts,
-            AVG(percentage)       AS avg_pct,
-            SUM(score)            AS earned_pts,
-            SUM(CASE WHEN passed = 1 THEN 1 ELSE 0 END) AS passed,
-            SUM(CASE WHEN passed = 0 THEN 1 ELSE 0 END) AS failed
+            COUNT(*)          AS attempts,
+            SUM(score)        AS earned_pts,
+            SUM(total_points) AS possible_pts
         FROM (
-            SELECT user_id, percentage, score, passed FROM quiz_attempts WHERE status = 'completed'
+            SELECT user_id, score, total_points FROM quiz_attempts
+             WHERE status = 'completed' AND course_id IS NOT NULL
             UNION ALL
-            SELECT user_id, percentage, score, passed FROM monthly_exam_attempts WHERE status = 'completed'
+            SELECT user_id, score, total_points FROM monthly_exam_attempts WHERE status = 'completed'
             UNION ALL
-            SELECT user_id, percentage, score, passed FROM semester_exam_attempts WHERE status = 'completed'
+            SELECT user_id, score, total_points FROM semester_exam_attempts WHERE status = 'completed'
         ) AS all_attempts
         GROUP BY user_id
     ";
 
     try {
-        $ownStmt = $conn->prepare("
-            SELECT attempts, avg_pct, earned_pts, passed, failed
-            FROM ($perUserSql) AS u WHERE user_id = ?
-        ");
+        $ownStmt = $conn->prepare("SELECT attempts, earned_pts FROM ($perUserSql) AS u WHERE user_id = ?");
         $ownStmt->execute([$userId]);
         $own = $ownStmt->fetch(PDO::FETCH_ASSOC) ?: [];
+        $academyEarnedPts = (float)($own['earned_pts'] ?? 0);
 
-        $academyAvgProgress = isset($own['avg_pct']) ? round((float)$own['avg_pct'], 1) : null;
-        $academyEarnedPts   = (float)($own['earned_pts'] ?? 0);
-        $academyPassedSubj  = (int)($own['passed'] ?? 0);
-        $academyFailedSubj  = (int)($own['failed'] ?? 0);
-        $academyInProgress  = 0;
+        // Subject results straight from the grade book (course_grade is in points out of the subject mark)
+        try {
+            $gbStmt = $conn->prepare("
+                SELECT
+                    AVG(g.course_grade)                                   AS avg_grade,
+                    SUM(CASE WHEN g.status = 'passed'      THEN 1 ELSE 0 END) AS n_passed,
+                    SUM(CASE WHEN g.status = 'failed'      THEN 1 ELSE 0 END) AS n_failed,
+                    SUM(CASE WHEN g.status = 'in_progress' THEN 1 ELSE 0 END) AS n_pending
+                FROM enrollment_course_grades g
+                JOIN course_enrollments e ON e.id = g.enrollment_id
+                WHERE e.user_id = ?
+            ");
+            $gbStmt->execute([$userId]);
+            $gb = $gbStmt->fetch(PDO::FETCH_ASSOC) ?: [];
+            $academyAvgProgress = ($gb['avg_grade'] ?? null) !== null ? round((float)$gb['avg_grade'], 1) : null;
+            $academyPassedSubj  = (int)($gb['n_passed']  ?? 0);
+            $academyFailedSubj  = (int)($gb['n_failed']  ?? 0);
+            $academyInProgress  = (int)($gb['n_pending'] ?? 0);
+        } catch (PDOException $e) {
+            error_log('courses.php grade-book summary: ' . $e->getMessage());
+        }
 
         try {
             $divStmt = $conn->prepare("
@@ -276,34 +312,30 @@ if ($tablesReady) {
             $academyFailedDivs = (int)($divRow['failed_divs'] ?? 0);
         } catch (PDOException $e) {}
 
-        $totalStmt = $conn->query("
-            SELECT COUNT(*) FROM ($perUserSql) AS u WHERE attempts > 0
-        ");
+        $totalStmt = $conn->query("SELECT COUNT(*) FROM ($perUserSql) AS u WHERE attempts > 0");
         $academyTotalUsers = (int)$totalStmt->fetchColumn();
 
-        if ($academyAvgProgress !== null && $academyTotalUsers > 0) {
-            $rankStmt = $conn->prepare("
-                SELECT COUNT(*) + 1 FROM ($perUserSql) AS u WHERE avg_pct > ?
-            ");
-            $rankStmt->execute([$academyAvgProgress]);
+        // Rank = by total points earned
+        if ($academyEarnedPts > 0 && $academyTotalUsers > 0) {
+            $rankStmt = $conn->prepare("SELECT COUNT(*) + 1 FROM ($perUserSql) AS u WHERE earned_pts > ?");
+            $rankStmt->execute([$academyEarnedPts]);
             $academyRank = (int)$rankStmt->fetchColumn();
         }
 
         $podiumStmt = $conn->query("
             SELECT
                 u.id AS user_id, u.username, u.full_name, u.email, u.profile_image,
-                agg.avg_pct, agg.earned_pts, agg.attempts
+                agg.earned_pts, agg.attempts
             FROM ($perUserSql) AS agg
             JOIN users u ON u.id = agg.user_id
             WHERE u.is_active = 1 AND agg.attempts > 0
-            ORDER BY agg.avg_pct DESC, agg.earned_pts DESC, u.id ASC
+            ORDER BY agg.earned_pts DESC, agg.attempts ASC, u.id ASC
             LIMIT 3
         ");
         $academyPodium = $podiumStmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
 
         foreach ($academyPodium as $i => &$row) {
             $row['rank']            = $i + 1;
-            $row['avg_progress']    = round((float)$row['avg_pct'], 1);
             $row['earned_pts']      = (int)round((float)$row['earned_pts']);
             $row['graded_subjects'] = (int)$row['attempts'];
             $row['display_name']    = $row['username'] ?: ($row['full_name'] ?: explode('@', (string)$row['email'])[0]);
@@ -343,23 +375,20 @@ if ($tablesReady) {
 
             $in = implode(',', array_fill(0, count($studentIds), '?'));
 
-            // Course-scoped via the exam/quiz rows (which carry course_id),
-            // so attempts belong to this course's exams only — no cross-course
-            // leakage here.
             $courseAggSql = "
-                SELECT user_id, AVG(percentage) AS avg_pct, COUNT(*) AS attempts
+                SELECT user_id, SUM(score) AS pts, COUNT(*) AS attempts
                 FROM (
-                    SELECT qa.user_id, qa.percentage
+                    SELECT qa.user_id, qa.score
                     FROM quiz_attempts qa
                     JOIN quizzes q ON q.id = qa.quiz_id
                     WHERE qa.status = 'completed' AND q.course_id = ? AND qa.user_id IN ($in)
                     UNION ALL
-                    SELECT mea.user_id, mea.percentage
+                    SELECT mea.user_id, mea.score
                     FROM monthly_exam_attempts mea
                     JOIN monthly_exams me ON me.id = mea.exam_id
                     WHERE mea.status = 'completed' AND me.course_id = ? AND mea.user_id IN ($in)
                     UNION ALL
-                    SELECT sea.user_id, sea.percentage
+                    SELECT sea.user_id, sea.score
                     FROM semester_exam_attempts sea
                     JOIN semester_exams se ON se.id = sea.exam_id
                     JOIN course_divisions cd ON cd.id = se.division_id
@@ -382,11 +411,11 @@ if ($tablesReady) {
                 $myRank = null;
                 $studentsWithAttempts = count($courseRows);
 
-                usort($courseRows, static fn($a, $b) => ((float)$b['avg_pct']) <=> ((float)$a['avg_pct']));
+                usort($courseRows, static fn($a, $b) => ((float)$b['pts']) <=> ((float)$a['pts']));
 
                 foreach ($courseRows as $i => $row) {
                     if ((int)$row['user_id'] === $userId) {
-                        $myAvg  = round((float)$row['avg_pct'], 1);
+                        $myAvg  = (int)round((float)$row['pts']);   // my points in this course
                         $myRank = $i + 1;
                         break;
                     }
@@ -432,8 +461,8 @@ if ($tablesReady) {
             foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $r) {
                 $ts = strtotime((string)($r['completed_at'] ?? ''));
                 if (!$ts) continue;
-                $pct = (float)($r['percentage'] ?? 0);
-                if ($pct <= 0 && (int)($r['score'] ?? 0) === 0) continue;
+                $pct = (float)($r['pct'] ?? 0);   // score / total_points, derived from the points
+                if ($pct <= 0 && (float)($r['score'] ?? 0) == 0) continue;
                 $collected[] = [
                     'ts'    => $ts,
                     'pct'   => max(0.0, min(100.0, $pct)),
@@ -445,9 +474,9 @@ if ($tablesReady) {
         }
     };
 
-    $collectFrom("SELECT completed_at, percentage, score FROM quiz_attempts WHERE user_id = ? AND status = 'completed' AND completed_at IS NOT NULL", [$userId], 'weekly');
-    $collectFrom("SELECT completed_at, percentage, score FROM monthly_exam_attempts WHERE user_id = ? AND status = 'completed' AND completed_at IS NOT NULL", [$userId], 'monthly');
-    $collectFrom("SELECT completed_at, percentage, score FROM semester_exam_attempts WHERE user_id = ? AND status = 'completed' AND completed_at IS NOT NULL", [$userId], 'semester');
+    $collectFrom("SELECT completed_at, score, ROUND(score / NULLIF(total_points, 0) * 100, 1) AS pct FROM quiz_attempts WHERE user_id = ? AND status = 'completed' AND course_id IS NOT NULL AND completed_at IS NOT NULL", [$userId], 'weekly');
+    $collectFrom("SELECT completed_at, score, ROUND(score / NULLIF(total_points, 0) * 100, 1) AS pct FROM monthly_exam_attempts WHERE user_id = ? AND status = 'completed' AND completed_at IS NOT NULL", [$userId], 'monthly');
+    $collectFrom("SELECT completed_at, score, ROUND(score / NULLIF(total_points, 0) * 100, 1) AS pct FROM semester_exam_attempts WHERE user_id = ? AND status = 'completed' AND completed_at IS NOT NULL", [$userId], 'semester');
 
     usort($collected, static fn($a, $b) => $a['ts'] <=> $b['ts']);
     if (count($collected) > 12) $collected = array_slice($collected, -12);
@@ -503,10 +532,9 @@ foreach ($myEnrollments as $en) {
 $timetableCount = count($myCoursesForTimetable);
 
 // ---- Exam summary ----
-$examSummary = ['taken' => 0, 'passed' => 0, 'failed' => 0, 'avg_pct' => null];
+$examSummary = ['taken' => 0, 'passed' => 0, 'failed' => 0, 'points' => 0, 'possible' => 0];
 
 if ($tablesReady) {
-    $allPcts = [];
     foreach ([
         'quiz_attempts'           => 'Weekly quizzes',
         'monthly_exam_attempts'   => 'Monthly exams',
@@ -517,9 +545,11 @@ if ($tablesReady) {
                 SELECT
                     COUNT(*) AS taken,
                     SUM(CASE WHEN passed = 1 THEN 1 ELSE 0 END) AS passed,
-                    SUM(CASE WHEN passed = 0 THEN 1 ELSE 0 END) AS failed
+                    SUM(CASE WHEN passed = 0 THEN 1 ELSE 0 END) AS failed,
+                    COALESCE(SUM(score), 0)        AS pts,
+                    COALESCE(SUM(total_points), 0) AS possible
                 FROM `$table`
-                WHERE user_id = ? AND status = 'completed'
+                WHERE user_id = ? AND status = 'completed'" . ($table === 'quiz_attempts' ? " AND course_id IS NOT NULL" : '') . "
             ");
             $stmt->execute([$userId]);
             $row = $stmt->fetch(PDO::FETCH_ASSOC) ?: [];
@@ -527,17 +557,11 @@ if ($tablesReady) {
             $examSummary['passed'] += (int)($row['passed'] ?? 0);
             $examSummary['failed'] += (int)($row['failed'] ?? 0);
 
-            $stmt = $conn->prepare("SELECT percentage FROM `$table` WHERE user_id = ? AND status = 'completed'");
-            $stmt->execute([$userId]);
-            foreach ($stmt->fetchAll(PDO::FETCH_COLUMN) as $p) {
-                $allPcts[] = (float)$p;
-            }
+            $examSummary['points']   += (float)($row['pts'] ?? 0);
+            $examSummary['possible'] += (float)($row['possible'] ?? 0);
         } catch (PDOException $e) {
             error_log("courses.php exam summary ($label): " . $e->getMessage());
         }
-    }
-    if ($allPcts) {
-        $examSummary['avg_pct'] = round(array_sum($allPcts) / count($allPcts), 1);
     }
 }
 
@@ -552,7 +576,6 @@ $tileGradients = [
 ];
 $tileIcons = ['📖', '🕌', '📚', '🌙', '✨'];
 
-// Helper — resolve a course image to a full URL or null
 function course_image_url(?string $path): ?string {
     $path = trim((string)$path);
     if ($path === '') return null;
@@ -963,9 +986,9 @@ body.dark-mode .zc-heading { border-bottom-color: #C9A85E !important; }
                     </div>
                     <div class="zc-rank-divider"></div>
                     <div class="zc-rank-item">
-                        <div class="zc-rank-label">📈 Avg progress</div>
+                        <div class="zc-rank-label">📈 Avg grade</div>
                         <div class="zc-rank-value">
-                            <?php echo $academyAvgProgress !== null ? (int)round($academyAvgProgress) . '%' : '--'; ?>
+                            <?php echo $academyAvgProgress !== null ? (int)round($academyAvgProgress) . '<small style="font-size:.5em;font-weight:700;"> pts</small>' : '--'; ?>
                         </div>
                         <div class="zc-rank-sub">
                             <?php echo $academyPassedSubj; ?> passed ·
@@ -1019,8 +1042,8 @@ body.dark-mode .zc-heading { border-bottom-color: #C9A85E !important; }
                                 <?php echo e($displayName); ?>
                             </div>
                             <div class="zc-podium-points">
-                                <?php echo number_format((float)$p['avg_progress'], 1); ?>% ·
-                                <?php echo (int)$p['earned_pts']; ?> pts
+                                <?php echo (int)$p['earned_pts']; ?> pts ·
+                                <?php echo (int)$p['graded_subjects']; ?> exam<?php echo (int)$p['graded_subjects'] === 1 ? '' : 's'; ?>
                             </div>
                         </div>
                     <?php endforeach; ?>
@@ -1039,7 +1062,7 @@ body.dark-mode .zc-heading { border-bottom-color: #C9A85E !important; }
                             <tr>
                                 <th>Rank</th>
                                 <th>Students</th>
-                                <th>Avg</th>
+                                <th>Points</th>
                                 <th>Course</th>
                             </tr>
                         </thead>
@@ -1047,7 +1070,7 @@ body.dark-mode .zc-heading { border-bottom-color: #C9A85E !important; }
                             <?php foreach ($academyScoreboard as $row):
                                 $rankDisplay = $row['rank'] !== null ? '#' . (int)$row['rank'] : '—';
                                 $avgDisplay = $row['avg_grade'] !== null
-                                    ? number_format((float)$row['avg_grade'], 1) . '%'
+                                    ? (int)$row['avg_grade'] . ' pts'
                                     : '—';
                             ?>
                                 <tr>
@@ -1144,8 +1167,8 @@ body.dark-mode .zc-heading { border-bottom-color: #C9A85E !important; }
                         <?php endif; ?>
 
                         <?php if ($en['_avg_grade'] !== null): ?>
-                            <span title="Average progress across all subjects this division">
-                                📊 Avg: <strong><?php echo e((string)$en['_avg_grade']); ?>%</strong>
+                            <span title="Average points per subject this division">
+                                📊 Avg: <strong><?php echo e((string)$en['_avg_grade']); ?> pts</strong>
                             </span>
                         <?php endif; ?>
                         <?php if ($en['_div_status'] === 'passed'): ?>
@@ -1399,9 +1422,9 @@ body.dark-mode .zc-heading { border-bottom-color: #C9A85E !important; }
                         </div>
                         <div class="zc-exam-stat">
                             <div class="v gold">
-                                <?php echo $examSummary['avg_pct'] !== null ? number_format((float)$examSummary['avg_pct'], 0) . '%' : '—'; ?>
+                                <?php echo $examSummary['possible'] > 0 ? (int)round($examSummary['points']) : '—'; ?>
                             </div>
-                            <div class="l">Avg score</div>
+                            <div class="l">Points</div>
                         </div>
                         <div class="zc-exam-stat">
                             <div class="v"><?php echo (int)$examSummary['passed']; ?></div>
